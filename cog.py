@@ -858,6 +858,11 @@ def _load_config(path):
     path = os.path.expanduser(path)
     raw = {}
     if os.path.exists(path):
+        if os.name != "nt":
+            mode = os.stat(path).st_mode & 0o777
+            if mode & 0o077:
+                print(f"Warning: {path} is accessible by others (mode {oct(mode)}). "
+                      f"Run: chmod 600 {path}", file=sys.stderr)
         with open(path) as f: raw = json.load(f)
     raw = _expand_env(raw)
     known = {f.name for f in Config.__dataclass_fields__.values()}
