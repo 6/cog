@@ -657,6 +657,10 @@ class TUI:
             if self.cpos > 0:
                 self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
                 self.cpos -= 1; self.redraw = True
+        elif ch == b"\x01":
+            self.cpos = 0; self.redraw = True
+        elif ch == b"\x05":
+            self.cpos = len(self.ibuf); self.redraw = True
         elif ch == b"\x03": self.running = False
         elif ch == b"\x0c": self.redraw = True
         elif ch == b"\x1b": self._esc()
@@ -665,22 +669,60 @@ class TUI:
             self.ibuf = self.ibuf[:self.cpos] + c + self.ibuf[self.cpos:]
             self.cpos += 1; self.redraw = True
 
+    def _word_left(self):
+        i = self.cpos
+        while i > 0 and not self.ibuf[i - 1].isalnum():
+            i -= 1
+        while i > 0 and self.ibuf[i - 1].isalnum():
+            i -= 1
+        return i
+
+    def _word_right(self):
+        i, n = self.cpos, len(self.ibuf)
+        while i < n and not self.ibuf[i].isalnum():
+            i += 1
+        while i < n and self.ibuf[i].isalnum():
+            i += 1
+        return i
+
     def _esc(self):
         if os.name == "nt": return
         r, _, _ = select.select([sys.stdin], [], [], 0.05)
         if not r: return
-        if os.read(_fd, 1) != b"[": return
+        ch2 = os.read(_fd, 1)
+        if ch2 == b"b":
+            self.cpos = self._word_left(); self.redraw = True; return
+        elif ch2 == b"f":
+            self.cpos = self._word_right(); self.redraw = True; return
+        elif ch2 == b"\x7f":
+            wp = self._word_left()
+            self.ibuf = self.ibuf[:wp] + self.ibuf[self.cpos:]
+            self.cpos = wp; self.redraw = True; return
+        if ch2 != b"[": return
         seq = b""
         while True:
             r, _, _ = select.select([sys.stdin], [], [], 0.05)
             if not r: break
             b = os.read(_fd, 1); seq += b
             if b and b[0] >= 0x40: break
-        vis = self.height - 5
-        if seq == b"5~":
+        if seq == b"D":
+            if self.cpos > 0: self.cpos -= 1; self.redraw = True
+        elif seq == b"C":
+            if self.cpos < len(self.ibuf): self.cpos += 1; self.redraw = True
+        elif seq == b"H" or seq == b"1~":
+            self.cpos = 0; self.redraw = True
+        elif seq == b"F" or seq == b"4~":
+            self.cpos = len(self.ibuf); self.redraw = True
+        elif seq == b"1;3D":
+            self.cpos = self._word_left(); self.redraw = True
+        elif seq == b"1;3C":
+            self.cpos = self._word_right(); self.redraw = True
+        elif seq == b"5~":
+            vis = self.height - 5
             self.scroll = min(self.scroll + vis, max(0, len(self.lines) - vis))
             self.redraw = True
         elif seq == b"6~":
+            vis = self.height - 5
             self.scroll = max(0, self.scroll - vis); self.redraw = True
 
     def run(self):
