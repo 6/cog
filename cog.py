@@ -9,11 +9,9 @@ import os
 import queue
 import re
 import select
-import signal
 import ssl
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 import urllib.parse
@@ -406,7 +404,8 @@ class Agent:
                     continue
                 output, is_error = self._dispatch(tu["name"], tu["input"])
                 if len(output.encode("utf-8", errors="replace")) > self.max_output:
-                    output = output[:self.max_output] + "\n[truncated]"
+                    half = self.max_output // 2
+                    output = output[:half] + "\n\n[... truncated ...]\n\n" + output[-half:]
                 tool_results.append({"type": "tool_result", "tool_use_id": tu["id"],
                                      "content": output, "is_error": is_error})
                 self.emit({"type": "tool_result", "tool_id": tu["id"],
@@ -482,12 +481,12 @@ def _restore_term():
         _original_termios = None
     sys.stdout.write("\033[?25h"); sys.stdout.flush()
 
-def _summarize_args(args, max_len=60):
+def _summarize_args(args, max_len=120):
     if not args: return ""
     parts = []
     for k, v in args.items():
         s = str(v)
-        if len(s) > 30: s = s[:27] + "..."
+        if len(s) > 80: s = s[:77] + "..."
         parts.append(f'{k}="{s}"')
     r = ", ".join(parts)
     return r[:max_len - 3] + "..." if len(r) > max_len else r
@@ -547,6 +546,7 @@ class TUI:
 █   █ █ █ █
 ▀▀▀ ▀▀▀ ▀▀▀{r}
 {d}model:{r} {self.model}
+{d}type{r} /help {d}for commands{r}
 """)
 
 
@@ -578,18 +578,21 @@ class TUI:
         for r in range(len(rows) - 1):
             if self.cpos < row_starts[r + 1]:
                 crow = r; break
-        pfx_w = len(rows[crow][0]) if rows else pfx_len
-        return rows, crow, pfx_w + self.cpos - row_starts[crow]
+        vis_pfx_w = pfx_len if crow == 0 else 2
+        return rows, crow, vis_pfx_w + self.cpos - row_starts[crow]
 
     def _draw_input(self):
         rows, crow, ccol = self._input_layout()
         sys.stdout.write("\033[?25l")
         # Clear current line and draw all input rows
         sys.stdout.write("\r\033[2K")
+        ghost = self._ghost_complete()
         for i, (prefix, text) in enumerate(rows):
             if i > 0:
                 sys.stdout.write("\n\033[2K")
             sys.stdout.write(prefix + text)
+            if ghost and i == len(rows) - 1:
+                sys.stdout.write(f"\033[2m{ghost}\033[0m")
         # Move cursor to the right position
         up = len(rows) - 1 - crow
         if up > 0:
@@ -619,6 +622,7 @@ class TUI:
         self._spinner = True
         self._spinner_frame = 0
         self._spinner_time = time.monotonic()
+        self._spin_line_active = True
 
     def _stop_spinner(self):
         if not self._spinner: return
@@ -668,6 +672,7 @@ class TUI:
             usage = ev.get("usage", {})
             self.tokens_in += usage.get("input_tokens", 0)
             self.tokens_out += usage.get("output_tokens", 0)
+            self._draw_input()
         elif t == "approval_request":
             self._stop_spinner()
             name, inp = ev.get("name", "?"), ev.get("input", {})
@@ -689,9 +694,15 @@ class TUI:
             text = self.ibuf.strip()
             if text:
                 self._clear_input()
-                _out(f"\n{self._prompt_prefix()} {self._caret()} {text}")
-                _out("")
                 self.ibuf, self.cpos = "", 0
+                if text.startswith("/"):
+                    ghost = self._ghost_complete()
+                    if ghost: text += ghost
+                    _out(f"{self._prompt_prefix()} {self._caret()} {text}")
+                    self._handle_slash(text)
+                    self._draw_input()
+                    return
+                _out(f"{self._prompt_prefix()} {self._caret()} {text}")
                 self.iq.put(text)
                 self._start_spinner()
                 return
@@ -708,6 +719,12 @@ class TUI:
             else:
                 self.ibuf = self.ibuf[:start] + self.ibuf[self.cpos:]
                 self.cpos = start
+        elif ch == b"\x09":  # Tab — accept ghost completion
+            if self.ibuf.startswith("/"):
+                ghost = self._ghost_complete()
+                if ghost:
+                    self.ibuf += ghost
+                    self.cpos = len(self.ibuf)
         elif ch == b"\x01": self.cpos = 0
         elif ch == b"\x05": self.cpos = len(self.ibuf)
         elif ch == b"\x03": self.running = False; return
@@ -730,6 +747,49 @@ class TUI:
         while i < n and not self.ibuf[i].isalnum(): i += 1
         while i < n and self.ibuf[i].isalnum(): i += 1
         return i
+
+    _SLASH_CMDS = ["/help", "/clear", "/tokens", "/model", "/quit", "/exit"]
+
+    def _ghost_complete(self):
+        buf = self.ibuf.strip()
+        if not buf.startswith("/") or " " in buf:
+            return ""
+        matches = [c for c in self._SLASH_CMDS if c.startswith(buf) and c != buf]
+        if len(matches) == 1:
+            return matches[0][len(buf):]
+        return ""
+
+    def _handle_slash(self, cmd):
+        d, r = "\033[2m", "\033[0m"
+        c = cmd.split()[0].lower()
+        if c == "/help":
+            _out(f"""
+{d}Commands:{r}
+  /help         show this message
+  /clear        clear screen
+  /tokens       show token usage
+  /model        show current model
+  /quit         exit
+
+{d}Shortcuts:{r}
+  Opt+Enter     newline
+  Opt+Left/Right  word jump
+  Opt+Delete    delete word
+  Cmd+Delete    delete line
+  Ctrl+A/E      home / end
+  Ctrl+C        exit
+""")
+        elif c == "/clear":
+            sys.stdout.write("\033[2J\033[H"); sys.stdout.flush()
+        elif c == "/tokens":
+            tok = self.tokens_in + self.tokens_out
+            _out(f"  {d}input:{r} {self.tokens_in:,}  {d}output:{r} {self.tokens_out:,}  {d}total:{r} {tok:,}")
+        elif c == "/model":
+            _out(f"  {self.model}")
+        elif c in ("/quit", "/exit"):
+            self.running = False; return
+        else:
+            _out(f"  {d}unknown command: {c} (try /help){r}")
 
     def _esc(self):
         r, _, _ = select.select([sys.stdin], [], [], 0.05)
@@ -767,7 +827,6 @@ class TUI:
                 while True:
                     try:
                         ev = self.eq.get_nowait()
-                        self._clear_spinner()
                         self._handle_event(ev)
                     except Exception: break
                 r, _, _ = select.select([sys.stdin], [], [], 0.02)
