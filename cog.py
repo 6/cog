@@ -14,6 +14,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -380,6 +381,7 @@ class Agent:
         self.max_calls = config.max_tool_calls_per_turn
         self.max_output = config.tool_output_max_bytes
         self.auto_approve = config.auto_approve
+        self.verbose = config.verbose
         self.log = config._log_fn
 
     def emit(self, event):
@@ -394,6 +396,8 @@ class Agent:
         tool_count = 0
         while True:
             req = build_request(self.model, self.system, self.messages, self.tools)
+            if self.verbose:
+                self.emit({"type": "verbose", "data": json.dumps(req, indent=2)})
             try:
                 resp, conn = stream_request(self.api_key, req, self.api_base_url)
             except APIError as e:
@@ -445,6 +449,8 @@ class Agent:
                                      "content": output, "is_error": is_error})
                 self.emit({"type": "tool_result", "tool_id": tu["id"],
                            "output": output, "is_error": is_error})
+                if self.verbose:
+                    self.emit({"type": "verbose", "data": output})
             self.messages.append({"role": "user", "content": tool_results})
             if tool_count > self.max_calls:
                 self.emit({"type": "turn_complete", "usage": usage}); return
@@ -565,6 +571,10 @@ class TUI:
         self.scroll, self.redraw, self.running = 0, True, True
         self.height, self.width = 24, 80
         self.cur_text, self.approval = "", None
+        self._spinner = False
+        self._spinner_frame = 0
+        self._spinner_time = 0.0
+        self._SPIN = "⠾⠽⠻⠯⠷"
 
     def _rule(self, row):
         _twrite(f"\033[{row};1H\033[2K\033[36m{'─' * self.width}\033[0m")
@@ -626,7 +636,10 @@ class TUI:
             _twrite(f"\033[{top+i};1H\033[2K")
             idx = start + i
             if 0 <= idx < len(self.lines):
-                _twrite(self.lines[idx][:self.width])
+                line = self.lines[idx]
+                for mk in ("___S___", "___SPIN___"):
+                    if line.startswith(mk): line = line[len(mk):]
+                _twrite(line[:self.width])
 
     def _full_redraw(self):
         self.height, self.width = _get_size()
@@ -653,15 +666,47 @@ class TUI:
         self.lines.extend(styled)
         if self.scroll == 0: self.redraw = True
 
+    def _start_spinner(self):
+        self._spinner = True
+        self._spinner_frame = 0
+        self._spinner_time = time.monotonic()
+        mk = "___SPIN___"
+        self.lines = [l for l in self.lines if not l.startswith(mk)]
+        self.lines.append(mk + f"\033[2m{self._SPIN[0]}\033[0m")
+        self.redraw = True
+
+    def _stop_spinner(self):
+        if not self._spinner:
+            return
+        self._spinner = False
+        mk = "___SPIN___"
+        self.lines = [l for l in self.lines if not l.startswith(mk)]
+
+    def _tick_spinner(self):
+        if not self._spinner:
+            return
+        now = time.monotonic()
+        if now - self._spinner_time < 0.08:
+            return
+        self._spinner_time = now
+        self._spinner_frame = (self._spinner_frame + 1) % len(self._SPIN)
+        mk = "___SPIN___"
+        ch = self._SPIN[self._spinner_frame]
+        self.lines = [l for l in self.lines if not l.startswith(mk)]
+        self.lines.append(mk + f"\033[2m{ch}\033[0m")
+        self.redraw = True
+
     def _handle_event(self, ev):
         t = ev.get("type")
         if t == "user_message":
             self._append([""])
             self._append(_wrap(f"\033[1mYou:\033[0m {ev.get('content','')}", self.width))
+            self._start_spinner()
         elif t == "assistant_text_delta":
+            self._stop_spinner()
             self.cur_text += ev.get("text", "")
-            tag = "\033[1mClaude:\033[0m "
-            new = _wrap(tag + self.cur_text, self.width)
+            tag = "\033[1mCog:\033[0m "
+            new = _wrap(tag + self.cur_text.lstrip("\n"), self.width)
             mk = "___S___"
             self.lines = [l for l in self.lines if not l.startswith(mk)] + [mk + l for l in new]
             if self.scroll == 0: self.redraw = True
@@ -670,16 +715,26 @@ class TUI:
             self.lines = [l[len(mk):] if l.startswith(mk) else l for l in self.lines]
             self.cur_text = ""
         elif t == "tool_call":
+            self._stop_spinner()
             s = _summarize_args(ev.get("input", {}))
             self._append(_wrap(f"\033[36m> {ev.get('name','?')}({s})\033[0m", self.width))
+            self._start_spinner()
         elif t == "tool_result":
+            self._stop_spinner()
             o = ev.get("output", "")
             if ev.get("is_error"):
                 self._append(_wrap(f"\033[31m< ERROR: {o[:200]}\033[0m", self.width))
             else:
                 self._append([f"\033[2m< [{len(o.encode('utf-8',errors='replace'))} bytes]\033[0m"])
+            self._start_spinner()
+        elif t == "verbose":
+            for line in ev.get("data", "").split("\n"):
+                self._append([f"\033[2m  {line}\033[0m"])
         elif t == "error":
+            self._stop_spinner()
             self._append(_wrap(f"\033[31m! {ev.get('message','')}\033[0m", self.width))
+        elif t == "turn_complete":
+            self._stop_spinner()
         elif t == "approval_request":
             self.approval = ev; self.redraw = True
 
@@ -805,6 +860,7 @@ class TUI:
                 else:
                     r, _, _ = select.select([sys.stdin], [], [], 0.02)
                     if r: self._handle_key(os.read(_fd, 1))
+                self._tick_spinner()
                 if self.redraw: self._full_redraw()
         finally:
             _restore_term()
@@ -821,12 +877,13 @@ class Config:
     api_base_url: str = "https://api.anthropic.com"
     skills_dirs: list = field(default_factory=list)
     mcp_servers: list = field(default_factory=list)
-    shell_enabled: bool = False
+    shell_enabled: bool = True
     max_tool_calls_per_turn: int = 10
     shell_timeout_seconds: int = 30
     tool_output_max_bytes: int = 32768
     log_dir: str = "~/.cog/logs"
     auto_approve: bool = False
+    verbose: bool = False
     # Set at runtime, not from config file
     api_key: str = ""
     system_prompt: str = ""
@@ -900,14 +957,16 @@ def main():
     ap = argparse.ArgumentParser(description="cog - minimal coding agent")
     ap.add_argument("--config", default="~/.cog/config.json")
     ap.add_argument("--cwd", default=".")
-    ap.add_argument("--shell", action="store_true")
+    ap.add_argument("--auto", action="store_true", help="auto-approve all tool calls")
+    ap.add_argument("--verbose", action="store_true", help="show full API JSON")
     args = ap.parse_args()
 
     cfg = _load_config(args.config)
     cwd = os.path.abspath(args.cwd)
-    if args.shell: cfg.shell_enabled = True
+    if args.auto: cfg.auto_approve = True
+    if args.verbose: cfg.verbose = True
     if not cfg.api_key:
-        print(f"Error: set {cfg.api_key_env} environment variable", file=sys.stderr)
+        print(f"Error: API key not found. Run: export {cfg.api_key_env}=your-key", file=sys.stderr)
         raise SystemExit(1)
 
     tools_configure(cwd=cwd, shell_enabled=cfg.shell_enabled,

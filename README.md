@@ -12,7 +12,7 @@ python3 cog.py
 
 Requires `ANTHROPIC_API_KEY` set in your environment (or a different env var via `api_key_env` in config).
 
-Add `--shell` to enable shell command execution. `--cwd PATH` to set the working directory.
+Flags: `--auto` to skip tool approval prompts, `--cwd PATH` to set working directory, `--verbose` for full API JSON.
 
 ## Config
 
@@ -23,7 +23,6 @@ Optional. Create `~/.cog/config.json`:
   "model": "claude-sonnet-4-20250514",
   "api_base_url": "https://api.anthropic.com",
   "api_key_env": "ANTHROPIC_API_KEY",
-  "shell_enabled": false,
   "auto_approve": false,
   "max_tool_calls_per_turn": 10,
   "shell_timeout_seconds": 30,
@@ -62,7 +61,7 @@ The same approach works for any provider that implements the Anthropic Messages 
 
 - **read_file** / **write_file** / **str_replace** -- file operations
 - **list_dir** -- directory listing
-- **run_shell** -- shell commands (requires `--shell` or `shell_enabled`)
+- **run_shell** -- shell commands
 - **MCP tools** -- discovered from configured MCP servers
 
 ## Keyboard shortcuts
