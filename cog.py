@@ -359,6 +359,8 @@ def mcp_discover_all(mcp_configs):
 
 _original_termios = None
 _fd = None
+_height = 24
+_width = 80
 
 
 def _set_cbreak():
@@ -377,14 +379,17 @@ def _restore_term():
         try: termios.tcsetattr(_fd, termios.TCSADRAIN, _original_termios)
         except Exception: pass
         _original_termios = None
-    sys.stdout.write("\033[?25h\033[r"); sys.stdout.flush()
+    sys.stdout.write("\033[?25h\033[r\033[?1049l")
+    sys.stdout.flush()
 
 
-def _get_size():
+def _refresh_size():
+    global _height, _width
     try:
-        c, r = os.get_terminal_size(); return max(r, 5), max(c, 20)
+        c, r = os.get_terminal_size()
+        _height, _width = max(r, 5), max(c, 20)
     except OSError:
-        return 24, 80
+        _height, _width = 24, 80
 
 
 def _summarize_args(args, max_len=60):
@@ -398,41 +403,64 @@ def _summarize_args(args, max_len=60):
     return r[:max_len - 3] + "..." if len(r) > max_len else r
 
 
-# ---------------------------------------------------------------------------
-# Status bar (pinned to bottom via scroll region)
-# ---------------------------------------------------------------------------
+def _out(s):
+    sys.stdout.write(s)
 
-def _setup_status(height, width, model, cwd, tool_count):
-    sys.stdout.write(f"\033[1;{height - 1}r")
-    _draw_status(height, width, model, cwd, tool_count)
-    sys.stdout.write(f"\033[{height - 1};1H")
+def _flush():
     sys.stdout.flush()
 
 
-def _draw_status(height, width, model, cwd, tool_count):
+# ---------------------------------------------------------------------------
+# Screen layout
+# ---------------------------------------------------------------------------
+# Row 1 to height-3:   output (scroll region)
+# Row height-2:        ─── separator (cyan)
+# Row height-1:        input
+# Row height:          status bar
+
+def _setup_screen(model, cwd, tool_count):
+    _refresh_size()
+    _out("\033[?1049h\033[2J")
+    _out(f"\033[1;{_height - 3}r")
+    _draw_rule()
+    _draw_status(model, cwd, tool_count)
+    _out(f"\033[1;1H")
+    _flush()
+
+
+def _draw_rule():
+    _out(f"\033[s\033[{_height - 2};1H\033[2K\033[36m{'─' * _width}\033[0m\033[u")
+
+
+def _draw_status(model, cwd, tool_count):
     cwd_short = os.path.basename(cwd) or cwd
     d, r = "\033[2m", "\033[0m"
     s = f" {d}model:{r} {model} {d}|{r} {d}cwd:{r} {cwd_short} {d}|{r} {d}tools:{r} {tool_count} "
-    sys.stdout.write(f"\033[s\033[{height};1H\033[2K{s}\033[u")
-    sys.stdout.flush()
+    _out(f"\033[s\033[{_height};1H\033[2K{s}\033[u")
+
+
+def _redraw_chrome(model, cwd, tool_count):
+    _refresh_size()
+    _out(f"\033[1;{_height - 3}r")
+    _draw_rule()
+    _draw_status(model, cwd, tool_count)
+    _flush()
+
+
+def _scroll_print(text=""):
+    """Print into the scroll region (moves cursor there, prints, returns)."""
+    _out(f"\033[s\033[{_height - 3};1H\n\033[2K{text}\033[u")
+    _flush()
+
+
+def _scroll_print_streaming(text):
+    """Print streaming text into scroll region without newline."""
+    _out(f"\033[s\033[{_height - 3};999H{text}\033[u")
+    _flush()
 
 
 # ---------------------------------------------------------------------------
-# Output (prints directly, no transcript buffer)
-# ---------------------------------------------------------------------------
-
-def _print(text=""):
-    sys.stdout.write(text + "\n")
-    sys.stdout.flush()
-
-
-def _print_streaming(text):
-    sys.stdout.write(text)
-    sys.stdout.flush()
-
-
-# ---------------------------------------------------------------------------
-# Input editor (raw mode, multiline)
+# Input editor (raw mode, multiline, draws at fixed row height-1)
 # ---------------------------------------------------------------------------
 
 class InputEditor:
@@ -459,9 +487,8 @@ class InputEditor:
         return i
 
     def _layout(self):
-        w = _get_size()[1]
-        first_cap = w - 3
-        cont_cap = max(w - 2, 1)
+        first_cap = _width - 3
+        cont_cap = max(_width - 2, 1)
         rows, row_starts = [], [0]
         prefix, cap, line = "❯ ", first_cap, ""
         for i, ch in enumerate(self.buf):
@@ -476,6 +503,9 @@ class InputEditor:
             else:
                 line += ch
         rows.append((prefix, line))
+        max_rows = max((_height - 4) // 2, 1)
+        if len(rows) > max_rows:
+            rows = rows[:max_rows]
         crow = len(rows) - 1
         for r in range(len(rows) - 1):
             if self.cpos < row_starts[r + 1]:
@@ -485,30 +515,32 @@ class InputEditor:
 
     def redraw(self):
         rows, crow, ccol = self._layout()
-        h, w = _get_size()
-        # Move to bottom of scroll region, clear lines, draw input
-        sys.stdout.write("\033[?25l")
-        # Position at start of input area
-        base = h - 1 - len(rows)
+        n = len(rows)
+        # Input area: rows from (height-1-n+1) to (height-1), i.e. grows upward from height-1
+        base = _height - n
+        _out("\033[?25l")
+        # Adjust scroll region to make room for multiline input
+        scroll_bottom = base - 2  # leave room for separator
+        if scroll_bottom < 1:
+            scroll_bottom = 1
+        _out(f"\033[1;{scroll_bottom}r")
+        # Draw separator just above input
+        _out(f"\033[{base - 1};1H\033[2K\033[36m{'─' * _width}\033[0m")
+        # Draw input rows
         for i, (prefix, text) in enumerate(rows):
-            sys.stdout.write(f"\033[{base + i};1H\033[2K{prefix}{text[:w - len(prefix)]}")
-        sys.stdout.write(f"\033[{base + crow};{ccol}H\033[?25h")
-        sys.stdout.flush()
+            _out(f"\033[{base + i};1H\033[2K{prefix}{text[:_width - len(prefix)]}")
+        # Position cursor
+        _out(f"\033[{base + crow};{ccol}H\033[?25h")
+        _flush()
 
-    def clear_display(self):
-        rows, _, _ = self._layout()
-        h, w = _get_size()
-        base = h - 1 - len(rows)
-        for i in range(len(rows)):
-            sys.stdout.write(f"\033[{base + i};1H\033[2K")
-        sys.stdout.flush()
+    def clear_input(self):
+        self.buf, self.cpos = "", 0
 
     def handle_key(self, ch):
         if ch in (b"\r", b"\n"):
             text = self.buf.strip()
             if text:
-                self.clear_display()
-                self.buf, self.cpos = "", 0
+                self.clear_input()
                 return text
             return None
         elif ch in (b"\x7f", b"\x08"):
@@ -591,37 +623,45 @@ class Agent:
             event["ts"] = datetime.now(timezone.utc).isoformat()
             self.log(event)
 
+    def _out(self, text):
+        """Print a line into the scroll region."""
+        _scroll_print(text)
+
+    def _out_stream(self, text):
+        """Append streaming text into the scroll region."""
+        _scroll_print_streaming(text)
+
     def run_turn(self, user_input):
         self.messages.append({"role": "user", "content": user_input})
         self._log({"type": "user_message", "content": user_input})
-        _print(f"\033[1mYou:\033[0m {user_input}\n")
+        self._out(f"\033[1mYou:\033[0m {user_input}")
         tool_count = 0
         while True:
             req = build_request(self.model, self.system, self.messages, self.tools)
             try:
                 resp, conn = stream_request(self.api_key, req)
             except APIError as e:
-                _print(f"\033[31m! {e}\033[0m"); return
+                self._out(f"\033[31m! {e}\033[0m"); return
             except Exception as e:
-                _print(f"\033[31m! Network error: {e}\033[0m"); return
+                self._out(f"\033[31m! Network error: {e}\033[0m"); return
 
             content_blocks, tool_uses, usage, full_text = [], [], {}, ""
             try:
-                _print_streaming("\033[1mClaude:\033[0m ")
+                self._out("")
+                self._out_stream("\033[1mClaude:\033[0m ")
                 for kind, payload in parse_sse_stream(resp):
                     if kind == "text_delta":
-                        _print_streaming(payload)
+                        self._out_stream(payload)
                     elif kind == "text_final":
                         full_text = payload
-                        _print("")
                     elif kind == "tool_use":
                         tool_uses.append(payload)
                         s = _summarize_args(payload["input"])
-                        _print(f"\033[36m> {payload['name']}({s})\033[0m")
+                        self._out(f"\033[36m> {payload['name']}({s})\033[0m")
                     elif kind == "usage":
                         usage = payload
             except Exception as e:
-                _print(f"\n\033[31m! Stream error: {e}\033[0m"); return
+                self._out(f"\033[31m! Stream error: {e}\033[0m"); return
             finally:
                 try: conn.close()
                 except Exception: pass
@@ -638,7 +678,7 @@ class Agent:
                 self.messages.append({"role": "assistant", "content": content_blocks})
             if not tool_uses:
                 self._log({"type": "turn_complete", "usage": usage})
-                _print("")
+                self._out("")
                 return
 
             tool_results = []
@@ -647,7 +687,7 @@ class Agent:
                 if tool_count > self.max_calls:
                     tool_results.append({"type": "tool_result", "tool_use_id": tu["id"],
                           "content": "ERROR: maximum tool calls exceeded", "is_error": True})
-                    _print(f"\033[31m< ERROR: maximum tool calls exceeded\033[0m")
+                    self._out(f"\033[31m< ERROR: maximum tool calls exceeded\033[0m")
                     continue
                 output, is_error = self._dispatch(tu["name"], tu["input"])
                 if len(output.encode("utf-8", errors="replace")) > self.max_output:
@@ -657,10 +697,10 @@ class Agent:
                 self._log({"type": "tool_result", "tool_id": tu["id"],
                            "output": output, "is_error": is_error})
                 if is_error:
-                    _print(f"\033[31m< ERROR: {output[:200]}\033[0m")
+                    self._out(f"\033[31m< ERROR: {output[:200]}\033[0m")
                 else:
                     byte_count = len(output.encode("utf-8", errors="replace"))
-                    _print(f"\033[2m< [{byte_count} bytes]\033[0m")
+                    self._out(f"\033[2m< [{byte_count} bytes]\033[0m")
             self.messages.append({"role": "user", "content": tool_results})
             if tool_count > self.max_calls:
                 self._log({"type": "turn_complete", "usage": usage}); return
@@ -691,7 +731,7 @@ class Agent:
 
     def _approve(self, name, input_args):
         s = _summarize_args(input_args)
-        _print(f"\033[33mAllow {name}({s})? [y/n]\033[0m ")
+        self._out(f"\033[33mAllow {name}({s})? [y/n]\033[0m")
         while True:
             if os.name == "nt":
                 import msvcrt
@@ -699,9 +739,9 @@ class Agent:
             else:
                 ch = os.read(_fd, 1)
             if ch in (b"y", b"Y"):
-                _print("  approved"); return True
+                self._out("  approved"); return True
             elif ch in (b"n", b"N"):
-                _print("  denied"); return False
+                self._out("  denied"); return False
 
 
 # ---------------------------------------------------------------------------
@@ -808,7 +848,7 @@ def main():
 
     agent = Agent(cfg, tool_reg)
     editor = InputEditor()
-    height, width = _get_size()
+    n_tools = len(tool_reg)
 
     if os.name == "nt":
         try:
@@ -821,11 +861,10 @@ def main():
 
     if os.name != "nt":
         def on_resize(sig, frame):
-            h, w = _get_size()
-            _setup_status(h, w, cfg["model"], cwd, len(tool_reg))
+            _redraw_chrome(cfg["model"], cwd, n_tools)
         signal.signal(signal.SIGWINCH, on_resize)
 
-    _setup_status(height, width, cfg["model"], cwd, len(tool_reg))
+    _setup_screen(cfg["model"], cwd, n_tools)
 
     try:
         editor.redraw()
@@ -846,15 +885,12 @@ def main():
                 break
             elif result is not None:
                 agent.run_turn(result)
-                # Refresh status bar after turn (in case of resize during turn)
-                h, w = _get_size()
-                _setup_status(h, w, cfg["model"], cwd, len(tool_reg))
+                _redraw_chrome(cfg["model"], cwd, n_tools)
             editor.redraw()
     except KeyboardInterrupt:
         pass
     finally:
         _restore_term()
-        _print("")
 
 
 if __name__ == "__main__":
