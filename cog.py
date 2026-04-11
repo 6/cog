@@ -526,6 +526,16 @@ class TUI:
     def _add(self, text, attr=0):
         self.transcript.append((text, attr))
 
+    def _wrapped_transcript(self, width):
+        """Wrap transcript lines to current width for display."""
+        out = []
+        for entry in self.transcript:
+            text, attr = entry[0], entry[1]
+            is_special = len(entry) > 2 and entry[2]
+            for line in _wrap(text, width - 1) if text else [""]:
+                out.append((line, attr, is_special) if is_special else (line, attr))
+        return out
+
     def _input_layout(self, w):
         first_cap, cont_cap = w - 3, max(w - 2, 1)
         rows, row_starts = [], [0]
@@ -549,28 +559,20 @@ class TUI:
         scr = self.scr
         h, w = scr.getmaxyx()
         scr.erase()
-        # Layout: transcript | rule | input | rule | status
+        # Layout: transcript | input (n rows) | status
         input_rows, crow, ccol = self._input_layout(w)
         n_input = len(input_rows)
-        input_base = h - 2 - n_input
-        sep_top = input_base - 1
-        t_bottom = sep_top - 1
-        # Draw transcript
-        vis = t_bottom
-        start = max(0, len(self.transcript) - vis - self.scroll)
-        for i in range(vis):
+        input_base = h - 1 - n_input
+        t_vis = input_base
+        # Draw transcript (wrapped to current width)
+        wrapped = self._wrapped_transcript(w)
+        start = max(0, len(wrapped) - t_vis - self.scroll)
+        for i in range(t_vis):
             idx = start + i
-            if 0 <= idx < len(self.transcript):
-                entry = self.transcript[idx]
-                text, attr = entry[0], entry[1]
-                try: scr.addnstr(i, 0, text, w - 1, attr)
+            if 0 <= idx < len(wrapped):
+                entry = wrapped[idx]
+                try: scr.addnstr(i, 0, entry[0], w - 1, entry[1])
                 except curses.error: pass
-        # Separators
-        rule = "─" * (w - 1)
-        try: scr.addstr(sep_top, 0, rule, C_CYAN)
-        except curses.error: pass
-        try: scr.addstr(h - 2, 0, rule, C_CYAN)
-        except curses.error: pass
         # Input
         for i, (prefix, text) in enumerate(input_rows):
             row = input_base + i
@@ -706,19 +708,22 @@ class TUI:
         elif ch == curses.KEY_HOME: self.cpos = 0
         elif ch == curses.KEY_END: self.cpos = len(self.ibuf)
         elif ch == curses.KEY_PPAGE:
-            h, _ = self.scr.getmaxyx()
-            vis = h - 5
-            self.scroll = min(self.scroll + vis, max(0, len(self.transcript) - vis))
+            h, w = self.scr.getmaxyx()
+            vis = h - 2
+            n_lines = len(self._wrapped_transcript(w))
+            self.scroll = min(self.scroll + vis, max(0, n_lines - vis))
         elif ch == curses.KEY_NPAGE:
             h, _ = self.scr.getmaxyx()
-            self.scroll = max(0, self.scroll - (h - 5))
+            self.scroll = max(0, self.scroll - (h - 2))
         elif ch == curses.KEY_MOUSE:
             try:
                 _, _, _, _, bstate = curses.getmouse()
-                # BUTTON4_PRESSED = scroll up; 0x200000 = scroll down (BUTTON5 not in Python 3.9)
-                if bstate & curses.BUTTON4_PRESSED:
-                    self.scroll = min(self.scroll + 3, max(0, len(self.transcript) - 5))
-                elif bstate & 0x200000:
+                h, w = self.scr.getmaxyx()
+                n_lines = len(self._wrapped_transcript(w))
+                max_scroll = max(0, n_lines - (h - 2))
+                if bstate & 0x80000:       # scroll up
+                    self.scroll = min(self.scroll + 3, max_scroll)
+                elif bstate & 0x8000000:   # scroll down
                     self.scroll = max(0, self.scroll - 3)
             except curses.error: pass
         elif ch == 27:  # ESC — read next for alt-key combos
@@ -727,14 +732,14 @@ class TUI:
             self.scr.timeout(20)
             if ch2 == ord("b"): self.cpos = self._word_left()
             elif ch2 == ord("f"): self.cpos = self._word_right()
-            elif ch2 == 127:  # Opt+Delete
+            elif ch2 in (127, curses.KEY_BACKSPACE):  # Opt+Delete
                 wp = self._word_left()
                 self.ibuf = self.ibuf[:wp] + self.ibuf[self.cpos:]
                 self.cpos = wp
             elif ch2 in (10, 13):  # Opt+Enter
                 self.ibuf = self.ibuf[:self.cpos] + "\n" + self.ibuf[self.cpos:]
                 self.cpos += 1
-            elif ch2 == 91:  # ESC [ — CSI sequence (e.g. Opt+arrows in some terminals)
+            elif ch2 == 91:  # ESC [ — CSI sequence (Opt+arrows in some terminals)
                 self.scr.timeout(50)
                 ch3 = self.scr.getch()
                 if ch3 == 49:  # ESC [ 1 ; ...
@@ -767,7 +772,7 @@ class TUI:
             self.scr = stdscr
             _init_colors()
             curses.curs_set(1)
-            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
             stdscr.keypad(True)
             stdscr.timeout(20)
             while True:
