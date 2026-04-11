@@ -6,14 +6,12 @@ import atexit
 import http.client
 import json
 import os
-import queue
 import re
 import select
 import signal
 import ssl
 import subprocess
 import sys
-import threading
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -356,89 +354,316 @@ def mcp_discover_all(mcp_configs):
 
 
 # ---------------------------------------------------------------------------
-# Agent
+# Terminal helpers
+# ---------------------------------------------------------------------------
+
+_original_termios = None
+_fd = None
+
+
+def _set_cbreak():
+    global _original_termios, _fd
+    if os.name == "nt": return
+    import termios, tty
+    _fd = sys.stdin.fileno()
+    _original_termios = termios.tcgetattr(_fd)
+    tty.setcbreak(_fd)
+
+
+def _restore_term():
+    global _original_termios
+    if _original_termios is not None:
+        import termios
+        try: termios.tcsetattr(_fd, termios.TCSADRAIN, _original_termios)
+        except Exception: pass
+        _original_termios = None
+    sys.stdout.write("\033[?25h\033[r"); sys.stdout.flush()
+
+
+def _get_size():
+    try:
+        c, r = os.get_terminal_size(); return max(r, 5), max(c, 20)
+    except OSError:
+        return 24, 80
+
+
+def _summarize_args(args, max_len=60):
+    if not args: return ""
+    parts = []
+    for k, v in args.items():
+        s = str(v)
+        if len(s) > 30: s = s[:27] + "..."
+        parts.append(f'{k}="{s}"')
+    r = ", ".join(parts)
+    return r[:max_len - 3] + "..." if len(r) > max_len else r
+
+
+# ---------------------------------------------------------------------------
+# Status bar (pinned to bottom via scroll region)
+# ---------------------------------------------------------------------------
+
+def _setup_status(height, width, model, cwd, tool_count):
+    sys.stdout.write(f"\033[1;{height - 1}r")
+    _draw_status(height, width, model, cwd, tool_count)
+    sys.stdout.write(f"\033[{height - 1};1H")
+    sys.stdout.flush()
+
+
+def _draw_status(height, width, model, cwd, tool_count):
+    cwd_short = os.path.basename(cwd) or cwd
+    d, r = "\033[2m", "\033[0m"
+    s = f" {d}model:{r} {model} {d}|{r} {d}cwd:{r} {cwd_short} {d}|{r} {d}tools:{r} {tool_count} "
+    sys.stdout.write(f"\033[s\033[{height};1H\033[2K{s}\033[u")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Output (prints directly, no transcript buffer)
+# ---------------------------------------------------------------------------
+
+def _print(text=""):
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def _print_streaming(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Input editor (raw mode, multiline)
+# ---------------------------------------------------------------------------
+
+class InputEditor:
+    def __init__(self):
+        self.buf = ""
+        self.cpos = 0
+
+    def _word_left(self):
+        i = self.cpos
+        if i > 0 and self.buf[i - 1] == "\n":
+            return i - 1
+        while i > 0 and not self.buf[i - 1].isalnum() and self.buf[i - 1] != "\n":
+            i -= 1
+        while i > 0 and self.buf[i - 1].isalnum():
+            i -= 1
+        return i
+
+    def _word_right(self):
+        i, n = self.cpos, len(self.buf)
+        while i < n and not self.buf[i].isalnum():
+            i += 1
+        while i < n and self.buf[i].isalnum():
+            i += 1
+        return i
+
+    def _layout(self):
+        w = _get_size()[1]
+        first_cap = w - 3
+        cont_cap = max(w - 2, 1)
+        rows, row_starts = [], [0]
+        prefix, cap, line = "❯ ", first_cap, ""
+        for i, ch in enumerate(self.buf):
+            if ch == "\n":
+                rows.append((prefix, line))
+                prefix, cap, line = "  ", cont_cap, ""
+                row_starts.append(i + 1)
+            elif len(line) >= cap:
+                rows.append((prefix, line))
+                prefix, cap, line = "  ", cont_cap, ch
+                row_starts.append(i)
+            else:
+                line += ch
+        rows.append((prefix, line))
+        crow = len(rows) - 1
+        for r in range(len(rows) - 1):
+            if self.cpos < row_starts[r + 1]:
+                crow = r; break
+        offset = self.cpos - row_starts[crow]
+        return rows, crow, 3 + offset
+
+    def redraw(self):
+        rows, crow, ccol = self._layout()
+        h, w = _get_size()
+        # Move to bottom of scroll region, clear lines, draw input
+        sys.stdout.write("\033[?25l")
+        # Position at start of input area
+        base = h - 1 - len(rows)
+        for i, (prefix, text) in enumerate(rows):
+            sys.stdout.write(f"\033[{base + i};1H\033[2K{prefix}{text[:w - len(prefix)]}")
+        sys.stdout.write(f"\033[{base + crow};{ccol}H\033[?25h")
+        sys.stdout.flush()
+
+    def clear_display(self):
+        rows, _, _ = self._layout()
+        h, w = _get_size()
+        base = h - 1 - len(rows)
+        for i in range(len(rows)):
+            sys.stdout.write(f"\033[{base + i};1H\033[2K")
+        sys.stdout.flush()
+
+    def handle_key(self, ch):
+        if ch in (b"\r", b"\n"):
+            text = self.buf.strip()
+            if text:
+                self.clear_display()
+                self.buf, self.cpos = "", 0
+                return text
+            return None
+        elif ch in (b"\x7f", b"\x08"):
+            if self.cpos > 0:
+                self.buf = self.buf[:self.cpos-1] + self.buf[self.cpos:]
+                self.cpos -= 1
+        elif ch == b"\x15":
+            nl = self.buf.rfind("\n", 0, self.cpos)
+            start = nl + 1 if nl >= 0 else 0
+            if start == self.cpos and self.cpos > 0:
+                self.buf = self.buf[:self.cpos-1] + self.buf[self.cpos:]
+                self.cpos -= 1
+            else:
+                self.buf = self.buf[:start] + self.buf[self.cpos:]
+                self.cpos = start
+        elif ch == b"\x01":
+            self.cpos = 0
+        elif ch == b"\x05":
+            self.cpos = len(self.buf)
+        elif ch == b"\x03":
+            return "___EXIT___"
+        elif ch == b"\x1b":
+            return self._handle_esc()
+        elif ch and ch[0:1].isascii() and ch[0] >= 32:
+            c = ch.decode("utf-8", errors="replace")
+            self.buf = self.buf[:self.cpos] + c + self.buf[self.cpos:]
+            self.cpos += 1
+        return None
+
+    def _handle_esc(self):
+        if os.name == "nt": return None
+        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not r: return None
+        ch2 = os.read(_fd, 1)
+        if ch2 in (b"\r", b"\n"):
+            self.buf = self.buf[:self.cpos] + "\n" + self.buf[self.cpos:]
+            self.cpos += 1
+        elif ch2 == b"b":
+            self.cpos = self._word_left()
+        elif ch2 == b"f":
+            self.cpos = self._word_right()
+        elif ch2 == b"\x7f":
+            wp = self._word_left()
+            self.buf = self.buf[:wp] + self.buf[self.cpos:]
+            self.cpos = wp
+        elif ch2 == b"[":
+            seq = b""
+            while True:
+                r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not r: break
+                b = os.read(_fd, 1); seq += b
+                if b and b[0] >= 0x40: break
+            if seq == b"D" and self.cpos > 0: self.cpos -= 1
+            elif seq == b"C" and self.cpos < len(self.buf): self.cpos += 1
+            elif seq in (b"H", b"1~"): self.cpos = 0
+            elif seq in (b"F", b"4~"): self.cpos = len(self.buf)
+            elif seq == b"1;3D": self.cpos = self._word_left()
+            elif seq == b"1;3C": self.cpos = self._word_right()
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Agent (single-threaded)
 # ---------------------------------------------------------------------------
 
 class Agent:
-    def __init__(self, config, tool_registry, event_queue, input_queue):
+    def __init__(self, config, tool_registry):
         self.model = config["model"]
         self.api_key = config["api_key"]
         self.system = config["system_prompt"]
         self.tools = tool_registry
-        self.eq = event_queue
-        self.iq = input_queue
         self.messages = []
         self.max_calls = config.get("max_tool_calls_per_turn", 10)
         self.max_output = config.get("tool_output_max_bytes", 32768)
         self.auto_approve = config.get("auto_approve", False)
         self.log = config.get("_log_fn")
 
-    def emit(self, event):
-        event["ts"] = datetime.now(timezone.utc).isoformat()
-        self.eq.put(event)
-        if self.log and event["type"] != "assistant_text_delta":
+    def _log(self, event):
+        if self.log:
+            event["ts"] = datetime.now(timezone.utc).isoformat()
             self.log(event)
 
     def run_turn(self, user_input):
         self.messages.append({"role": "user", "content": user_input})
-        self.emit({"type": "user_message", "content": user_input})
+        self._log({"type": "user_message", "content": user_input})
+        _print(f"\033[1mYou:\033[0m {user_input}\n")
         tool_count = 0
         while True:
             req = build_request(self.model, self.system, self.messages, self.tools)
             try:
                 resp, conn = stream_request(self.api_key, req)
             except APIError as e:
-                self.emit({"type": "error", "message": str(e)}); return
+                _print(f"\033[31m! {e}\033[0m"); return
             except Exception as e:
-                self.emit({"type": "error", "message": f"Network error: {e}"}); return
+                _print(f"\033[31m! Network error: {e}\033[0m"); return
+
             content_blocks, tool_uses, usage, full_text = [], [], {}, ""
             try:
+                _print_streaming("\033[1mClaude:\033[0m ")
                 for kind, payload in parse_sse_stream(resp):
                     if kind == "text_delta":
-                        self.emit({"type": "assistant_text_delta", "text": payload})
+                        _print_streaming(payload)
                     elif kind == "text_final":
                         full_text = payload
-                        self.emit({"type": "assistant_text_final", "text": payload})
+                        _print("")
                     elif kind == "tool_use":
                         tool_uses.append(payload)
-                        self.emit({"type": "tool_call", "tool_id": payload["id"],
-                                   "name": payload["name"], "input": payload["input"]})
+                        s = _summarize_args(payload["input"])
+                        _print(f"\033[36m> {payload['name']}({s})\033[0m")
                     elif kind == "usage":
                         usage = payload
             except Exception as e:
-                self.emit({"type": "error", "message": f"Stream error: {e}"}); return
+                _print(f"\n\033[31m! Stream error: {e}\033[0m"); return
             finally:
                 try: conn.close()
                 except Exception: pass
+
             if full_text:
                 content_blocks.append({"type": "text", "text": full_text})
+                self._log({"type": "assistant_text_final", "text": full_text})
             for tu in tool_uses:
                 content_blocks.append({"type": "tool_use", "id": tu["id"],
                                        "name": tu["name"], "input": tu["input"]})
+                self._log({"type": "tool_call", "tool_id": tu["id"],
+                           "name": tu["name"], "input": tu["input"]})
             if content_blocks:
                 self.messages.append({"role": "assistant", "content": content_blocks})
             if not tool_uses:
-                self.emit({"type": "turn_complete", "usage": usage}); return
+                self._log({"type": "turn_complete", "usage": usage})
+                _print("")
+                return
+
             tool_results = []
             for tu in tool_uses:
                 tool_count += 1
                 if tool_count > self.max_calls:
-                    tr = {"type": "tool_result", "tool_use_id": tu["id"],
-                          "content": "ERROR: maximum tool calls per turn exceeded", "is_error": True}
-                    tool_results.append(tr)
-                    self.emit({"type": "tool_result", "tool_id": tu["id"],
-                               "output": tr["content"], "is_error": True})
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu["id"],
+                          "content": "ERROR: maximum tool calls exceeded", "is_error": True})
+                    _print(f"\033[31m< ERROR: maximum tool calls exceeded\033[0m")
                     continue
                 output, is_error = self._dispatch(tu["name"], tu["input"])
                 if len(output.encode("utf-8", errors="replace")) > self.max_output:
                     output = output[:self.max_output] + "\n[truncated]"
                 tool_results.append({"type": "tool_result", "tool_use_id": tu["id"],
                                      "content": output, "is_error": is_error})
-                self.emit({"type": "tool_result", "tool_id": tu["id"],
+                self._log({"type": "tool_result", "tool_id": tu["id"],
                            "output": output, "is_error": is_error})
+                if is_error:
+                    _print(f"\033[31m< ERROR: {output[:200]}\033[0m")
+                else:
+                    byte_count = len(output.encode("utf-8", errors="replace"))
+                    _print(f"\033[2m< [{byte_count} bytes]\033[0m")
             self.messages.append({"role": "user", "content": tool_results})
             if tool_count > self.max_calls:
-                self.emit({"type": "turn_complete", "usage": usage}); return
+                self._log({"type": "turn_complete", "usage": usage}); return
 
     def _dispatch(self, name, input_args):
         if name not in self.tools:
@@ -465,344 +690,18 @@ class Agent:
         return f"ERROR: unknown tool type for '{name}'", True
 
     def _approve(self, name, input_args):
-        self.emit({"type": "approval_request", "name": name, "input": input_args})
-        try:
-            resp = self.iq.get(timeout=300)
-            return isinstance(resp, dict) and resp.get("type") == "approval" and resp.get("approved")
-        except queue.Empty:
-            return False
-
-    def worker_loop(self):
+        s = _summarize_args(input_args)
+        _print(f"\033[33mAllow {name}({s})? [y/n]\033[0m ")
         while True:
-            msg = self.iq.get()
-            if msg is None:
-                break
-            if isinstance(msg, dict):
-                continue
-            try:
-                self.run_turn(msg)
-            except Exception as e:
-                self.emit({"type": "error", "message": f"Agent error: {e}"})
-
-
-# ---------------------------------------------------------------------------
-# TUI
-# ---------------------------------------------------------------------------
-
-_original_termios = None
-_in_alt_screen = False
-_fd = None
-
-
-def _twrite(s):
-    sys.stdout.write(s)
-
-def _tflush():
-    sys.stdout.flush()
-
-def _enter_alt():
-    global _in_alt_screen
-    _twrite("\033[?1049h\033[2J\033[H"); _tflush(); _in_alt_screen = True
-
-def _exit_alt():
-    global _in_alt_screen
-    if _in_alt_screen:
-        _twrite("\033[?1049l"); _tflush(); _in_alt_screen = False
-
-def _set_cbreak():
-    global _original_termios, _fd
-    if os.name == "nt": return
-    import termios, tty
-    _fd = sys.stdin.fileno()
-    _original_termios = termios.tcgetattr(_fd)
-    tty.setcbreak(_fd)
-
-def _restore_term():
-    global _original_termios
-    if _original_termios is not None:
-        import termios
-        try: termios.tcsetattr(_fd, termios.TCSADRAIN, _original_termios)
-        except Exception: pass
-        _original_termios = None
-    _twrite("\033[?25h"); _exit_alt(); _tflush()
-
-def _get_size():
-    try:
-        c, r = os.get_terminal_size(); return max(r, 5), max(c, 20)
-    except OSError:
-        return 24, 80
-
-def _wrap(text, width):
-    lines = []
-    for raw in text.split("\n"):
-        if not raw: lines.append(""); continue
-        while len(raw) > width:
-            lines.append(raw[:width]); raw = raw[width:]
-        lines.append(raw)
-    return lines
-
-def _summarize_args(args, max_len=60):
-    if not args: return ""
-    parts = []
-    for k, v in args.items():
-        s = str(v)
-        if len(s) > 30: s = s[:27] + "..."
-        parts.append(f'{k}="{s}"')
-    r = ", ".join(parts)
-    return r[:max_len - 3] + "..." if len(r) > max_len else r
-
-
-class TUI:
-    def __init__(self, event_queue, input_queue, model="", cwd="", tool_count=0):
-        self.eq, self.iq = event_queue, input_queue
-        self.model, self.cwd, self.tool_count = model, cwd, tool_count
-        self.lines, self.ibuf, self.cpos = [], "", 0
-        self.scroll, self.redraw, self.running = 0, True, True
-        self.height, self.width = 24, 80
-        self.cur_text, self.approval = "", None
-
-    def _rule(self, row):
-        _twrite(f"\033[{row};1H\033[2K\033[36m{'─' * self.width}\033[0m")
-
-    def _input_layout(self):
-        w = self.width
-        first_cap = w - 3
-        cont_cap = max(w - 2, 1)
-        rows = []
-        row_starts = [0]
-        prefix = "❯ "
-        cap = first_cap
-        line = ""
-        for i, ch in enumerate(self.ibuf):
-            if ch == "\n":
-                rows.append((prefix, line))
-                prefix, cap, line = "  ", cont_cap, ""
-                row_starts.append(i + 1)
-            elif len(line) >= cap:
-                rows.append((prefix, line))
-                prefix, cap, line = "  ", cont_cap, ch
-                row_starts.append(i)
+            if os.name == "nt":
+                import msvcrt
+                ch = msvcrt.getch()
             else:
-                line += ch
-        rows.append((prefix, line))
-        max_rows = max((self.height - 4) // 2, 1)
-        if len(rows) > max_rows:
-            rows = rows[:max_rows]
-        crow = len(rows) - 1
-        for r in range(len(rows) - 1):
-            if self.cpos < row_starts[r + 1]:
-                crow = r; break
-        offset = self.cpos - row_starts[crow]
-        ccol = 3 + offset
-        return rows, crow, ccol
-
-    def _draw_status(self):
-        cwd_short = os.path.basename(self.cwd) or self.cwd
-        d = "\033[2m"
-        r = "\033[0m"
-        s = f" {d}model:{r} {self.model} {d}|{r} {d}cwd:{r} {cwd_short} {d}|{r} {d}tools:{r} {self.tool_count} "
-        _twrite(f"\033[{self.height};1H\033[2K{s}")
-
-    def _draw_input(self, input_rows, base_row):
-        for i, (prefix, text) in enumerate(input_rows):
-            row = base_row + i
-            _twrite(f"\033[{row};1H\033[2K{prefix}{text[:self.width - len(prefix)]}")
-        if self.approval:
-            name, inp = self.approval.get("name", "?"), self.approval.get("input", {})
-            _twrite(f"\033[{base_row};1H\033[2K")
-            _twrite(f"\033[33mAllow {name}({_summarize_args(inp)})? [y/n] \033[0m")
-
-    def _draw_transcript(self, t_bottom):
-        top = 1
-        vis = t_bottom - top + 1
-        if vis <= 0: return
-        start = max(0, len(self.lines) - vis - self.scroll)
-        for i in range(vis):
-            _twrite(f"\033[{top+i};1H\033[2K")
-            idx = start + i
-            if 0 <= idx < len(self.lines):
-                _twrite(self.lines[idx][:self.width])
-
-    def _full_redraw(self):
-        self.height, self.width = _get_size()
-        input_rows, crow, ccol = self._input_layout()
-        n_input = len(input_rows)
-        # Layout: transcript | sep | input (n rows) | sep | status
-        # status = height, bottom sep = height-1, input = height-2-n+1..height-2
-        input_base = self.height - 1 - n_input
-        sep_top = input_base - 1
-        t_bottom = sep_top - 1
-        _twrite("\033[?25l")
-        _twrite(f"\033[1;{self.height}r")
-        _twrite("\033[2J")
-        self._draw_transcript(t_bottom)
-        self._rule(sep_top)
-        self._draw_input(input_rows, input_base)
-        self._rule(self.height - 1)
-        self._draw_status()
-        _twrite(f"\033[{input_base + crow};{ccol}H")
-        _twrite("\033[?25h")
-        _tflush(); self.redraw = False
-
-    def _append(self, styled):
-        self.lines.extend(styled)
-        if self.scroll == 0: self.redraw = True
-
-    def _handle_event(self, ev):
-        t = ev.get("type")
-        if t == "user_message":
-            self._append([""])
-            self._append(_wrap(f"\033[1mYou:\033[0m {ev.get('content','')}", self.width))
-        elif t == "assistant_text_delta":
-            self.cur_text += ev.get("text", "")
-            tag = "\033[1mClaude:\033[0m "
-            new = _wrap(tag + self.cur_text, self.width)
-            mk = "___S___"
-            self.lines = [l for l in self.lines if not l.startswith(mk)] + [mk + l for l in new]
-            if self.scroll == 0: self.redraw = True
-        elif t == "assistant_text_final":
-            mk = "___S___"
-            self.lines = [l[len(mk):] if l.startswith(mk) else l for l in self.lines]
-            self.cur_text = ""
-        elif t == "tool_call":
-            s = _summarize_args(ev.get("input", {}))
-            self._append(_wrap(f"\033[36m> {ev.get('name','?')}({s})\033[0m", self.width))
-        elif t == "tool_result":
-            o = ev.get("output", "")
-            if ev.get("is_error"):
-                self._append(_wrap(f"\033[31m< ERROR: {o[:200]}\033[0m", self.width))
-            else:
-                self._append([f"\033[2m< [{len(o.encode('utf-8',errors='replace'))} bytes]\033[0m"])
-        elif t == "error":
-            self._append(_wrap(f"\033[31m! {ev.get('message','')}\033[0m", self.width))
-        elif t == "approval_request":
-            self.approval = ev; self.redraw = True
-
-    def _handle_key(self, ch):
-        if self.approval:
+                ch = os.read(_fd, 1)
             if ch in (b"y", b"Y"):
-                self.iq.put({"type": "approval", "approved": True})
+                _print("  approved"); return True
             elif ch in (b"n", b"N"):
-                self.iq.put({"type": "approval", "approved": False})
-            else:
-                return
-            self.approval = None; self.redraw = True; return
-        if ch in (b"\r", b"\n"):
-            text = self.ibuf.strip()
-            if text: self.ibuf = ""; self.cpos = 0; self.iq.put(text)
-            self.redraw = True
-        elif ch in (b"\x7f", b"\x08"):
-            if self.cpos > 0:
-                self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
-                self.cpos -= 1; self.redraw = True
-        elif ch == b"\x15":
-            nl = self.ibuf.rfind("\n", 0, self.cpos)
-            start = nl + 1 if nl >= 0 else 0
-            if start == self.cpos and self.cpos > 0:
-                # Already at line start — delete the newline to join with previous line
-                self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
-                self.cpos -= 1
-            else:
-                self.ibuf = self.ibuf[:start] + self.ibuf[self.cpos:]
-                self.cpos = start
-            self.redraw = True
-        elif ch == b"\x01":
-            self.cpos = 0; self.redraw = True
-        elif ch == b"\x05":
-            self.cpos = len(self.ibuf); self.redraw = True
-        elif ch == b"\x03": self.running = False
-        elif ch == b"\x0c": self.redraw = True
-        elif ch == b"\x1b": self._esc()
-        elif ch and ch[0:1].isascii() and ch[0] >= 32:
-            c = ch.decode("utf-8", errors="replace")
-            self.ibuf = self.ibuf[:self.cpos] + c + self.ibuf[self.cpos:]
-            self.cpos += 1; self.redraw = True
-
-    def _word_left(self):
-        i = self.cpos
-        if i > 0 and self.ibuf[i - 1] == "\n":
-            return i - 1
-        while i > 0 and not self.ibuf[i - 1].isalnum() and self.ibuf[i - 1] != "\n":
-            i -= 1
-        while i > 0 and self.ibuf[i - 1].isalnum():
-            i -= 1
-        return i
-
-    def _word_right(self):
-        i, n = self.cpos, len(self.ibuf)
-        while i < n and not self.ibuf[i].isalnum():
-            i += 1
-        while i < n and self.ibuf[i].isalnum():
-            i += 1
-        return i
-
-    def _esc(self):
-        if os.name == "nt": return
-        r, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if not r: return
-        ch2 = os.read(_fd, 1)
-        if ch2 in (b"\r", b"\n"):
-            self.ibuf = self.ibuf[:self.cpos] + "\n" + self.ibuf[self.cpos:]
-            self.cpos += 1; self.redraw = True; return
-        elif ch2 == b"b":
-            self.cpos = self._word_left(); self.redraw = True; return
-        elif ch2 == b"f":
-            self.cpos = self._word_right(); self.redraw = True; return
-        elif ch2 == b"\x7f":
-            wp = self._word_left()
-            self.ibuf = self.ibuf[:wp] + self.ibuf[self.cpos:]
-            self.cpos = wp; self.redraw = True; return
-        if ch2 != b"[": return
-        seq = b""
-        while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if not r: break
-            b = os.read(_fd, 1); seq += b
-            if b and b[0] >= 0x40: break
-        if seq == b"D":
-            if self.cpos > 0: self.cpos -= 1; self.redraw = True
-        elif seq == b"C":
-            if self.cpos < len(self.ibuf): self.cpos += 1; self.redraw = True
-        elif seq == b"H" or seq == b"1~":
-            self.cpos = 0; self.redraw = True
-        elif seq == b"F" or seq == b"4~":
-            self.cpos = len(self.ibuf); self.redraw = True
-        elif seq == b"1;3D":
-            self.cpos = self._word_left(); self.redraw = True
-        elif seq == b"1;3C":
-            self.cpos = self._word_right(); self.redraw = True
-        elif seq == b"5~":
-            vis = self.height - 5
-            self.scroll = min(self.scroll + vis, max(0, len(self.lines) - vis))
-            self.redraw = True
-        elif seq == b"6~":
-            vis = self.height - 5
-            self.scroll = max(0, self.scroll - vis); self.redraw = True
-
-    def run(self):
-        if os.name == "nt":
-            try:
-                import ctypes
-                ctypes.windll.kernel32.SetConsoleMode(ctypes.windll.kernel32.GetStdHandle(-11), 7)
-            except Exception: pass
-        _set_cbreak(); atexit.register(_restore_term); _enter_alt()
-        if os.name != "nt":
-            signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "redraw", True))
-        try:
-            self._full_redraw()
-            while self.running:
-                while True:
-                    try: self._handle_event(self.eq.get_nowait())
-                    except Exception: break
-                if os.name == "nt":
-                    import msvcrt
-                    if msvcrt.kbhit(): self._handle_key(msvcrt.getch())
-                else:
-                    r, _, _ = select.select([sys.stdin], [], [], 0.02)
-                    if r: self._handle_key(os.read(_fd, 1))
-                if self.redraw: self._full_redraw()
-        finally:
-            _restore_term()
+                _print("  denied"); return False
 
 
 # ---------------------------------------------------------------------------
@@ -907,11 +806,55 @@ def main():
     cfg["system_prompt"] = prompt
     cfg["_log_fn"] = lambda ev: (log_f.write(json.dumps(ev) + "\n"), log_f.flush())
 
-    eq, iq = queue.Queue(), queue.Queue()
-    agent = Agent(cfg, tool_reg, eq, iq)
-    threading.Thread(target=agent.worker_loop, daemon=True).start()
-    TUI(eq, iq, model=cfg["model"], cwd=cwd, tool_count=len(tool_reg)).run()
-    iq.put(None)
+    agent = Agent(cfg, tool_reg)
+    editor = InputEditor()
+    height, width = _get_size()
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleMode(ctypes.windll.kernel32.GetStdHandle(-11), 7)
+        except Exception: pass
+
+    _set_cbreak()
+    atexit.register(_restore_term)
+
+    if os.name != "nt":
+        def on_resize(sig, frame):
+            h, w = _get_size()
+            _setup_status(h, w, cfg["model"], cwd, len(tool_reg))
+        signal.signal(signal.SIGWINCH, on_resize)
+
+    _setup_status(height, width, cfg["model"], cwd, len(tool_reg))
+
+    try:
+        editor.redraw()
+        while True:
+            if os.name == "nt":
+                import msvcrt
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                else:
+                    import time; time.sleep(0.02); continue
+            else:
+                r, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if not r:
+                    continue
+                ch = os.read(_fd, 1)
+            result = editor.handle_key(ch)
+            if result == "___EXIT___":
+                break
+            elif result is not None:
+                agent.run_turn(result)
+                # Refresh status bar after turn (in case of resize during turn)
+                h, w = _get_size()
+                _setup_status(h, w, cfg["model"], cwd, len(tool_reg))
+            editor.redraw()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _restore_term()
+        _print("")
 
 
 if __name__ == "__main__":
