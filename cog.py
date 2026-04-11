@@ -384,12 +384,15 @@ class Agent:
                 try: conn.close()
                 except Exception: pass
             if full_text:
-                content_blocks.append({"type": "text", "text": full_text})
+                content_blocks.append({"type": "text", "text": full_text.strip()})
             for tu in tool_uses:
                 content_blocks.append({"type": "tool_use", "id": tu["id"],
                                        "name": tu["name"], "input": tu["input"]})
             if content_blocks:
                 self.messages.append({"role": "assistant", "content": content_blocks})
+            if self.verbose:
+                self.emit({"type": "verbose", "data": json.dumps(
+                    {"role": "assistant", "content": content_blocks, "usage": usage}, indent=2)})
             if not tool_uses:
                 self.emit({"type": "turn_complete", "usage": usage}); return
             tool_results = []
@@ -408,10 +411,10 @@ class Agent:
                     output = output[:half] + "\n\n[... truncated ...]\n\n" + output[-half:]
                 tool_results.append({"type": "tool_result", "tool_use_id": tu["id"],
                                      "content": output, "is_error": is_error})
-                self.emit({"type": "tool_result", "tool_id": tu["id"],
-                           "output": output, "is_error": is_error})
                 if self.verbose:
                     self.emit({"type": "verbose", "data": output})
+                self.emit({"type": "tool_result", "tool_id": tu["id"],
+                           "output": output, "is_error": is_error})
             self.messages.append({"role": "user", "content": tool_results})
             if tool_count > self.max_calls:
                 self.emit({"type": "turn_complete", "usage": usage}); return
@@ -652,7 +655,7 @@ class TUI:
         elif t == "tool_call":
             self._stop_spinner()
             s = _summarize_args(ev.get("input", {}))
-            _out(f"\033[36m> {ev.get('name','?')}({s})\033[0m")
+            _out(f"\033[36;1m> {ev.get('name','?')}\033[0m\033[2m({s})\033[0m")
         elif t == "tool_result":
             self._stop_spinner()
             o = ev.get("output", "")
