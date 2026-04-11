@@ -40,7 +40,24 @@ Optional. Create `~/.cog/config.json`:
 
 All fields are optional and fall back to defaults shown above. `${ENV_VAR}` syntax is expanded in string values.
 
-For Minimax or other Anthropic-compatible APIs, change `api_base_url` and `model`.
+### Using with Minimax
+
+Minimax provides an [Anthropic-compatible API](https://platform.minimax.io/docs/api-reference/text-anthropic-api). To use it, set `api_base_url` and `model` in your config, and set your Minimax API key in the `ANTHROPIC_API_KEY` env var:
+
+```json
+{
+  "api_base_url": "https://api.minimax.io/anthropic",
+  "model": "MiniMax-M2.7"
+}
+```
+
+```
+ANTHROPIC_API_KEY=your-minimax-key python3 cog.py
+```
+
+Available models: `MiniMax-M2.7`, `MiniMax-M2.5`, `MiniMax-M2.1` (and `-highspeed` variants).
+
+The same approach works for any other provider that implements the Anthropic Messages API format — just change `api_base_url` and `model`.
 
 ## Tools
 
