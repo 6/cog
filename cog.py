@@ -21,26 +21,21 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
+# --- Tools ---
 
 _cwd = "."
 _shell_timeout = 30
-
 
 def tools_configure(cwd=".", shell_timeout=30):
     global _cwd, _shell_timeout
     _cwd = os.path.abspath(cwd)
     _shell_timeout = shell_timeout
 
-
 def _resolve(path):
     p = Path(path)
     if not p.is_absolute():
         p = Path(_cwd) / p
     return str(p.resolve())
-
 
 def tool_read_file(args):
     path = _resolve(args["path"])
@@ -58,7 +53,6 @@ def tool_read_file(args):
     except Exception as e:
         return f"ERROR: {e}"
 
-
 def tool_list_dir(args):
     path = _resolve(args.get("path", "."))
     try:
@@ -74,7 +68,6 @@ def tool_list_dir(args):
         lines.append(f"{kind} {name}")
     return "\n".join(lines) if lines else "(empty directory)"
 
-
 def tool_write_file(args):
     path = _resolve(args["path"])
     content = args["content"]
@@ -85,7 +78,6 @@ def tool_write_file(args):
         return f"OK: wrote {len(content.encode('utf-8'))} bytes to {path}"
     except Exception as e:
         return f"ERROR: {e}"
-
 
 def tool_str_replace(args):
     path = _resolve(args["path"])
@@ -105,7 +97,6 @@ def tool_str_replace(args):
     Path(path).write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
     return "OK: replacement made"
 
-
 def tool_run_shell(args):
     try:
         r = subprocess.run(
@@ -119,11 +110,9 @@ def tool_run_shell(args):
     except Exception as e:
         return f"ERROR: {e}"
 
-
 def _schema(name, desc, props, required):
     return {"name": name, "description": desc,
             "input_schema": {"type": "object", "properties": props, "required": required}}
-
 
 _TOOL_DEFS = {
     "read_file": (tool_read_file, _schema(
@@ -153,20 +142,15 @@ _TOOL_DEFS = {
         ["command"])),
 }
 
-
 def get_tools():
     return {name: ("builtin", fn, schema) for name, (fn, schema) in _TOOL_DEFS.items()}
 
-
-# ---------------------------------------------------------------------------
-# Anthropic API
-# ---------------------------------------------------------------------------
+# --- Anthropic API ---
 
 class APIError(Exception):
     def __init__(self, status, body):
         self.status, self.body = status, body
         super().__init__(f"API error {status}: {body}")
-
 
 def build_request(model, system, messages, tools, max_tokens=4096):
     req = {"model": model, "max_tokens": max_tokens, "system": system,
@@ -174,7 +158,6 @@ def build_request(model, system, messages, tools, max_tokens=4096):
     if tools:
         req["tools"] = [t for _, _, t in tools.values()]
     return req
-
 
 def stream_request(api_key, request_body, api_base_url="https://api.anthropic.com"):
     parsed = urllib.parse.urlparse(api_base_url)
@@ -195,7 +178,6 @@ def stream_request(api_key, request_body, api_base_url="https://api.anthropic.co
         conn.close()
         raise APIError(resp.status, body)
     return resp, conn
-
 
 def parse_sse_stream(response):
     event_type = block_type = block_id = block_name = None
@@ -249,20 +231,15 @@ def parse_sse_stream(response):
             yield ("usage", dict(usage))
         event_type = None
 
-
-# ---------------------------------------------------------------------------
-# MCP Client
-# ---------------------------------------------------------------------------
+# --- MCP Client ---
 
 class MCPError(Exception):
     pass
-
 
 def _mcp_connect(parsed_url):
     if parsed_url.scheme == "https":
         return http.client.HTTPSConnection(parsed_url.hostname, parsed_url.port or 443, timeout=30)
     return http.client.HTTPConnection(parsed_url.hostname, parsed_url.port or 80, timeout=30)
-
 
 def _mcp_post(server, method, params=None, is_notification=False):
     parsed = urllib.parse.urlparse(server["url"])
@@ -293,7 +270,6 @@ def _mcp_post(server, method, params=None, is_notification=False):
     conn.close()
     return result
 
-
 def _mcp_read_sse(resp, request_id):
     while True:
         line = resp.readline()
@@ -308,7 +284,6 @@ def _mcp_read_sse(resp, request_id):
     resp.read()
     return None
 
-
 def mcp_initialize(cfg):
     server = dict(cfg, _next_id=0, _session_id=None)
     result = _mcp_post(server, "initialize", {
@@ -318,7 +293,6 @@ def mcp_initialize(cfg):
         raise MCPError(f"initialize failed: {result['error']}")
     _mcp_post(server, "notifications/initialized", is_notification=True)
     return server
-
 
 def mcp_call_tool(server, tool_name, arguments):
     result = _mcp_post(server, "tools/call", {"name": tool_name, "arguments": arguments})
@@ -331,7 +305,6 @@ def mcp_call_tool(server, tool_name, arguments):
     for item in result.get("result", {}).get("content", []):
         parts.append(item.get("text", "") if item.get("type") == "text" else json.dumps(item))
     return "\n".join(parts) if parts else "(empty result)"
-
 
 def mcp_discover_all(mcp_configs):
     if not mcp_configs:
@@ -355,10 +328,7 @@ def mcp_discover_all(mcp_configs):
             print(f"Warning: MCP server '{name}' failed: {e}", file=sys.stderr)
     return tools, servers
 
-
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
+# --- Agent ---
 
 class Agent:
     def __init__(self, config, tool_registry, event_queue, input_queue):
@@ -491,14 +461,10 @@ class Agent:
             except Exception as e:
                 self.emit({"type": "error", "message": f"Agent error: {e}"})
 
-
-# ---------------------------------------------------------------------------
-# TUI
-# ---------------------------------------------------------------------------
+# --- TUI ---
 
 _original_termios = None
 _fd = None
-
 
 def _twrite(s):
     sys.stdout.write(s)
@@ -552,7 +518,6 @@ def _summarize_args(args, max_len=60):
     r = ", ".join(parts)
     return r[:max_len - 3] + "..." if len(r) > max_len else r
 
-
 def _git_branch(cwd):
     try:
         r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -562,7 +527,6 @@ def _git_branch(cwd):
     except Exception:
         pass
     return None
-
 
 class TUI:
     def __init__(self, event_queue, input_queue, model="", cwd="", tool_count=0):
@@ -896,10 +860,7 @@ class TUI:
         finally:
             _restore_term()
 
-
-# ---------------------------------------------------------------------------
-# Config & Main
-# ---------------------------------------------------------------------------
+# --- Config & Main ---
 
 @dataclass
 class Config:
@@ -932,14 +893,12 @@ _SYSTEM = (
     "- Keep responses concise unless the user asks for detail.\n"
 )
 
-
 def _expand_env(v):
     if isinstance(v, str):
         return re.sub(r"\$\{([^}]+)\}", lambda m: os.environ.get(m.group(1), ""), v)
     if isinstance(v, dict): return {k: _expand_env(val) for k, val in v.items()}
     if isinstance(v, list): return [_expand_env(i) for i in v]
     return v
-
 
 def _load_config(path):
     path = os.path.expanduser(path)
@@ -958,7 +917,6 @@ def _load_config(path):
     cfg.skills_dirs = [os.path.expanduser(p) for p in cfg.skills_dirs]
     cfg.api_key = os.environ.get(cfg.api_key_env, "")
     return cfg
-
 
 def _load_skills(dirs):
     skills = []
@@ -981,7 +939,6 @@ def _load_skills(dirs):
             body = "\n".join(lines[i+1:]).strip()
             if body: skills.append({"name": name, "text": body})
     return skills
-
 
 def main():
     ap = argparse.ArgumentParser(description="cog - minimal coding agent")
@@ -1020,7 +977,6 @@ def main():
     threading.Thread(target=agent.worker_loop, daemon=True).start()
     TUI(eq, iq, model=cfg.model, cwd=cwd, tool_count=len(tool_reg)).run()
     iq.put(None)
-
 
 if __name__ == "__main__":
     main()
