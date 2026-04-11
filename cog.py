@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import urllib.parse
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -182,12 +183,19 @@ def build_request(model, system, messages, tools, max_tokens=4096):
     return req
 
 
-def stream_request(api_key, request_body):
-    conn = http.client.HTTPSConnection("api.anthropic.com", timeout=120,
-                                       context=ssl.create_default_context())
+def stream_request(api_key, request_body, api_base_url="https://api.anthropic.com"):
+    parsed = urllib.parse.urlparse(api_base_url)
+    host = parsed.hostname
+    port = parsed.port
+    base_path = (parsed.path or "").rstrip("/")
+    if parsed.scheme == "https":
+        conn = http.client.HTTPSConnection(host, port or 443, timeout=120,
+                                           context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(host, port or 80, timeout=120)
     headers = {"Content-Type": "application/json", "X-API-Key": api_key,
                "anthropic-version": "2023-06-01"}
-    conn.request("POST", "/v1/messages", json.dumps(request_body), headers)
+    conn.request("POST", f"{base_path}/v1/messages", json.dumps(request_body), headers)
     resp = conn.getresponse()
     if resp.status != 200:
         body = resp.read().decode("utf-8", errors="replace")
@@ -361,17 +369,18 @@ def mcp_discover_all(mcp_configs):
 
 class Agent:
     def __init__(self, config, tool_registry, event_queue, input_queue):
-        self.model = config["model"]
-        self.api_key = config["api_key"]
-        self.system = config["system_prompt"]
+        self.model = config.model
+        self.api_key = config.api_key
+        self.api_base_url = config.api_base_url
+        self.system = config.system_prompt
         self.tools = tool_registry
         self.eq = event_queue
         self.iq = input_queue
         self.messages = []
-        self.max_calls = config.get("max_tool_calls_per_turn", 10)
-        self.max_output = config.get("tool_output_max_bytes", 32768)
-        self.auto_approve = config.get("auto_approve", False)
-        self.log = config.get("_log_fn")
+        self.max_calls = config.max_tool_calls_per_turn
+        self.max_output = config.tool_output_max_bytes
+        self.auto_approve = config.auto_approve
+        self.log = config._log_fn
 
     def emit(self, event):
         event["ts"] = datetime.now(timezone.utc).isoformat()
@@ -386,7 +395,7 @@ class Agent:
         while True:
             req = build_request(self.model, self.system, self.messages, self.tools)
             try:
-                resp, conn = stream_request(self.api_key, req)
+                resp, conn = stream_request(self.api_key, req, self.api_base_url)
             except APIError as e:
                 self.emit({"type": "error", "message": str(e)}); return
             except Exception as e:
@@ -805,12 +814,23 @@ class TUI:
 # Config & Main
 # ---------------------------------------------------------------------------
 
-_DEFAULTS = {
-    "model": "claude-sonnet-4-20250514", "api_key_env": "ANTHROPIC_API_KEY",
-    "skills_dirs": [], "mcp_servers": [], "shell_enabled": False,
-    "max_tool_calls_per_turn": 10, "shell_timeout_seconds": 30,
-    "tool_output_max_bytes": 32768, "log_dir": "~/.agent/logs", "auto_approve": False,
-}
+@dataclass
+class Config:
+    model: str = "claude-sonnet-4-20250514"
+    api_key_env: str = "ANTHROPIC_API_KEY"
+    api_base_url: str = "https://api.anthropic.com"
+    skills_dirs: list = field(default_factory=list)
+    mcp_servers: list = field(default_factory=list)
+    shell_enabled: bool = False
+    max_tool_calls_per_turn: int = 10
+    shell_timeout_seconds: int = 30
+    tool_output_max_bytes: int = 32768
+    log_dir: str = "~/.cog/logs"
+    auto_approve: bool = False
+    # Set at runtime, not from config file
+    api_key: str = ""
+    system_prompt: str = ""
+    _log_fn: object = None
 
 _SYSTEM = (
     "You are a coding agent working in the directory: {cwd}\n\n"
@@ -835,16 +855,16 @@ def _expand_env(v):
 
 
 def _load_config(path):
-    cfg = dict(_DEFAULTS)
     path = os.path.expanduser(path)
+    raw = {}
     if os.path.exists(path):
-        with open(path) as f: cfg.update(json.load(f))
-    cfg = _expand_env(cfg)
-    for key in ("log_dir", "skills_dirs"):
-        v = cfg[key]
-        if isinstance(v, str): cfg[key] = os.path.expanduser(v)
-        elif isinstance(v, list): cfg[key] = [os.path.expanduser(p) for p in v]
-    cfg["api_key"] = os.environ.get(cfg["api_key_env"], "")
+        with open(path) as f: raw = json.load(f)
+    raw = _expand_env(raw)
+    known = {f.name for f in Config.__dataclass_fields__.values()}
+    cfg = Config(**{k: v for k, v in raw.items() if k in known})
+    cfg.log_dir = os.path.expanduser(cfg.log_dir)
+    cfg.skills_dirs = [os.path.expanduser(p) for p in cfg.skills_dirs]
+    cfg.api_key = os.environ.get(cfg.api_key_env, "")
     return cfg
 
 
@@ -873,40 +893,39 @@ def _load_skills(dirs):
 
 def main():
     ap = argparse.ArgumentParser(description="cog - minimal coding agent")
-    ap.add_argument("--config", default="~/.agent/config.json")
+    ap.add_argument("--config", default="~/.cog/config.json")
     ap.add_argument("--cwd", default=".")
     ap.add_argument("--shell", action="store_true")
     args = ap.parse_args()
 
     cfg = _load_config(args.config)
     cwd = os.path.abspath(args.cwd)
-    if args.shell: cfg["shell_enabled"] = True
-    if not cfg["api_key"]:
-        print(f"Error: set {cfg['api_key_env']} environment variable", file=sys.stderr)
+    if args.shell: cfg.shell_enabled = True
+    if not cfg.api_key:
+        print(f"Error: set {cfg.api_key_env} environment variable", file=sys.stderr)
         raise SystemExit(1)
 
-    tools_configure(cwd=cwd, shell_enabled=cfg["shell_enabled"],
-                    shell_timeout=cfg.get("shell_timeout_seconds", 30))
-    skills = _load_skills(cfg.get("skills_dirs", []))
+    tools_configure(cwd=cwd, shell_enabled=cfg.shell_enabled,
+                    shell_timeout=cfg.shell_timeout_seconds)
+    skills = _load_skills(cfg.skills_dirs)
     prompt = _SYSTEM.format(cwd=cwd)
     for s in skills:
         prompt += f'\n<skill name="{s["name"]}">\n{s["text"]}\n</skill>\n'
 
-    tool_reg = get_tools(cfg["shell_enabled"])
-    mcp_tools, _ = mcp_discover_all(cfg.get("mcp_servers", []))
+    tool_reg = get_tools(cfg.shell_enabled)
+    mcp_tools, _ = mcp_discover_all(cfg.mcp_servers)
     tool_reg.update(mcp_tools)
 
-    log_dir = os.path.expanduser(cfg["log_dir"])
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S") + ".jsonl")
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    log_path = os.path.join(cfg.log_dir, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S") + ".jsonl")
     log_f = open(log_path, "a")
-    cfg["system_prompt"] = prompt
-    cfg["_log_fn"] = lambda ev: (log_f.write(json.dumps(ev) + "\n"), log_f.flush())
+    cfg.system_prompt = prompt
+    cfg._log_fn = lambda ev: (log_f.write(json.dumps(ev) + "\n"), log_f.flush())
 
     eq, iq = queue.Queue(), queue.Queue()
     agent = Agent(cfg, tool_reg, eq, iq)
     threading.Thread(target=agent.worker_loop, daemon=True).start()
-    TUI(eq, iq, model=cfg["model"], cwd=cwd, tool_count=len(tool_reg)).run()
+    TUI(eq, iq, model=cfg.model, cwd=cwd, tool_count=len(tool_reg)).run()
     iq.put(None)
 
 
