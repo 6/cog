@@ -561,23 +561,28 @@ class TUI:
         self.height, self.width = 24, 80
         self.cur_text, self.approval = "", None
 
+    def _rule(self, row):
+        _twrite(f"\033[{row};1H\033[2K\033[36m{'─' * self.width}\033[0m")
+
     def _draw_status(self):
         cwd_short = os.path.basename(self.cwd) or self.cwd
         s = f" model: {self.model} | cwd: {cwd_short} | tools: {self.tool_count} "
-        _twrite(f"\033[1;1H\033[2K\033[7m{s[:self.width].ljust(self.width)}\033[0m")
+        _twrite(f"\033[{self.height};1H\033[2K\033[7m{s[:self.width].ljust(self.width)}\033[0m")
 
     def _draw_input(self):
-        _twrite(f"\033[{self.height-1};1H\033[2K\033[{self.height};1H\033[2K")
+        _twrite(f"\033[{self.height-2};1H\033[2K")
         if self.approval:
             name, inp = self.approval.get("name", "?"), self.approval.get("input", {})
             _twrite(f"\033[33mAllow {name}({_summarize_args(inp)})? [y/n] \033[0m")
         else:
+            prefix = "❯ "
             vis = self.ibuf[:self.width - 3]
-            _twrite("> " + vis)
-            _twrite(f"\033[{self.height};{min(self.cpos, self.width-3)+3}H")
+            _twrite(prefix + vis)
+            col = 3 + min(self.cpos, self.width - 3)
+            _twrite(f"\033[{self.height-2};{col}H")
 
     def _draw_transcript(self):
-        top, bottom = 2, self.height - 2
+        top, bottom = 1, self.height - 4
         vis = bottom - top + 1
         if vis <= 0: return
         start = max(0, len(self.lines) - vis - self.scroll)
@@ -589,8 +594,16 @@ class TUI:
 
     def _full_redraw(self):
         self.height, self.width = _get_size()
-        _twrite(f"\033[2J\033[{2};{self.height-2}r")
-        self._draw_status(); self._draw_transcript(); self._draw_input()
+        _twrite("\033[?25l")
+        _twrite(f"\033[1;{self.height}r")
+        _twrite("\033[2J")
+        self._draw_transcript()
+        self._rule(self.height - 3)
+        self._draw_input()
+        self._rule(self.height - 1)
+        self._draw_status()
+        _twrite(f"\033[{self.height-2};{3 + min(self.cpos, self.width-3)}H")
+        _twrite("\033[?25h")
         _tflush(); self.redraw = False
 
     def _append(self, styled):
@@ -663,7 +676,7 @@ class TUI:
             if not r: break
             b = os.read(_fd, 1); seq += b
             if b and b[0] >= 0x40: break
-        vis = self.height - 4
+        vis = self.height - 5
         if seq == b"5~":
             self.scroll = min(self.scroll + vis, max(0, len(self.lines) - vis))
             self.redraw = True
