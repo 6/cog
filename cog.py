@@ -490,7 +490,6 @@ class Agent:
 # ---------------------------------------------------------------------------
 
 _original_termios = None
-_in_alt_screen = False
 _fd = None
 
 
@@ -501,13 +500,10 @@ def _tflush():
     sys.stdout.flush()
 
 def _enter_alt():
-    global _in_alt_screen
-    _twrite("\033[?1049h\033[2J\033[H"); _tflush(); _in_alt_screen = True
+    _twrite("\033[2J\033[H"); _tflush()
 
 def _exit_alt():
-    global _in_alt_screen
-    if _in_alt_screen:
-        _twrite("\033[?1049l"); _tflush(); _in_alt_screen = False
+    pass
 
 def _set_cbreak():
     global _original_termios, _fd
@@ -524,7 +520,7 @@ def _restore_term():
         try: termios.tcsetattr(_fd, termios.TCSADRAIN, _original_termios)
         except Exception: pass
         _original_termios = None
-    _twrite("\033[?25h"); _exit_alt(); _tflush()
+    _twrite("\033[?25h\033[r"); _tflush()
 
 def _get_size():
     try:
