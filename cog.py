@@ -13,6 +13,7 @@ import signal
 import ssl
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import urllib.parse
@@ -25,14 +26,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 _cwd = "."
-_shell_enabled = False
 _shell_timeout = 30
 
 
-def tools_configure(cwd=".", shell_enabled=False, shell_timeout=30):
-    global _cwd, _shell_enabled, _shell_timeout
+def tools_configure(cwd=".", shell_timeout=30):
+    global _cwd, _shell_timeout
     _cwd = os.path.abspath(cwd)
-    _shell_enabled = shell_enabled
     _shell_timeout = shell_timeout
 
 
@@ -108,8 +107,6 @@ def tool_str_replace(args):
 
 
 def tool_run_shell(args):
-    if not _shell_enabled:
-        return "ERROR: Shell is disabled. Enable with --shell flag or shell_enabled in config."
     try:
         r = subprocess.run(
             args["command"], shell=True, capture_output=True, text=True,
@@ -157,13 +154,8 @@ _TOOL_DEFS = {
 }
 
 
-def get_tools(shell_enabled=False):
-    tools = {}
-    for name, (fn, schema) in _TOOL_DEFS.items():
-        if name == "run_shell" and not shell_enabled:
-            continue
-        tools[name] = ("builtin", fn, schema)
-    return tools
+def get_tools():
+    return {name: ("builtin", fn, schema) for name, (fn, schema) in _TOOL_DEFS.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -546,10 +538,8 @@ def _get_size():
 def _wrap(text, width):
     lines = []
     for raw in text.split("\n"):
-        if not raw: lines.append(""); continue
-        while len(raw) > width:
-            lines.append(raw[:width]); raw = raw[width:]
-        lines.append(raw)
+        if not raw: lines.append("")
+        else: lines.extend(textwrap.wrap(raw, width, break_on_hyphens=False) or [""])
     return lines
 
 def _summarize_args(args, max_len=60):
@@ -918,7 +908,6 @@ class Config:
     api_base_url: str = "https://api.anthropic.com"
     skills_dirs: list = field(default_factory=list)
     mcp_servers: list = field(default_factory=list)
-    shell_enabled: bool = True
     max_tool_calls_per_turn: int = 10
     shell_timeout_seconds: int = 30
     tool_output_max_bytes: int = 32768
@@ -1010,14 +999,13 @@ def main():
         print(f"Error: API key not found. Run: export {cfg.api_key_env}=your-key", file=sys.stderr)
         raise SystemExit(1)
 
-    tools_configure(cwd=cwd, shell_enabled=cfg.shell_enabled,
-                    shell_timeout=cfg.shell_timeout_seconds)
+    tools_configure(cwd=cwd, shell_timeout=cfg.shell_timeout_seconds)
     skills = _load_skills(cfg.skills_dirs)
     prompt = _SYSTEM.format(cwd=cwd)
     for s in skills:
         prompt += f'\n<skill name="{s["name"]}">\n{s["text"]}\n</skill>\n'
 
-    tool_reg = get_tools(cfg.shell_enabled)
+    tool_reg = get_tools()
     mcp_tools, _ = mcp_discover_all(cfg.mcp_servers)
     tool_reg.update(mcp_tools)
 
