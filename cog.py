@@ -2,12 +2,14 @@
 """cog - minimal coding agent. Stdlib-only, Python 3.9+."""
 
 import argparse
-import curses
+import atexit
 import http.client
 import json
 import os
 import queue
 import re
+import select
+import signal
 import ssl
 import subprocess
 import sys
@@ -18,9 +20,6 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-
-# silence curses escape delay
-os.environ.setdefault("ESCDELAY", "25")
 
 # --- Tools ---
 
@@ -464,6 +463,43 @@ class Agent:
 
 # --- TUI ---
 
+_original_termios = None
+_fd = None
+
+def _twrite(s):
+    sys.stdout.write(s)
+
+def _tflush():
+    sys.stdout.flush()
+
+def _enter_alt():
+    _twrite("\033[2J\033[H\033[?1000h\033[?1006h"); _tflush()
+
+def _exit_alt():
+    _twrite("\033[?1006l\033[?1000l"); _tflush()
+
+def _set_cbreak():
+    global _original_termios, _fd
+    import termios, tty
+    _fd = sys.stdin.fileno()
+    _original_termios = termios.tcgetattr(_fd)
+    tty.setcbreak(_fd)
+
+def _restore_term():
+    global _original_termios
+    if _original_termios is not None:
+        import termios
+        try: termios.tcsetattr(_fd, termios.TCSADRAIN, _original_termios)
+        except Exception: pass
+        _original_termios = None
+    _twrite("\033[?25h\033[r"); _tflush()
+
+def _get_size():
+    try:
+        c, r = os.get_terminal_size(); return max(r, 5), max(c, 20)
+    except OSError:
+        return 24, 80
+
 def _wrap(text, width):
     lines = []
     for raw in text.split("\n"):
@@ -491,175 +527,181 @@ def _git_branch(cwd):
         pass
     return None
 
-C_CYAN = C_RED = C_YELLOW = C_DIM = C_BOLD = 0
-
-def _init_colors():
-    global C_CYAN, C_RED, C_YELLOW, C_DIM, C_BOLD
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)
-    curses.init_pair(2, curses.COLOR_RED, -1)
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)
-    C_CYAN = curses.color_pair(1)
-    C_RED = curses.color_pair(2)
-    C_YELLOW = curses.color_pair(3)
-    C_DIM = curses.A_DIM
-    C_BOLD = curses.A_BOLD
-
 class TUI:
     def __init__(self, event_queue, input_queue, model="", cwd="", tool_count=0):
         self.eq, self.iq = event_queue, input_queue
         self.model, self.cwd, self.tool_count = model, cwd, tool_count
         self.git_branch = _git_branch(cwd)
-        self.tokens_in = self.tokens_out = 0
-        self.transcript = []  # list of (str, attr) tuples
-        self.ibuf, self.cpos = "", 0
-        self.scroll = 0
-        self.cur_text = ""
-        self.approval = None
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.lines, self.ibuf, self.cpos = [], "", 0
+        self.scroll, self.redraw, self.running = 0, True, True
+        self.height, self.width = 24, 80
+        self.cur_text, self.approval = "", None
         self._spinner = False
         self._spinner_frame = 0
         self._spinner_time = 0.0
         self._SPIN = "⠷⠯⠻⠽⠾"
-        self.scr = None
 
-    def _add(self, text, attr=0):
-        self.transcript.append((text, attr))
+    def _rule(self, row):
+        _twrite(f"\033[{row};1H\033[2K\033[36m{'─' * self.width}\033[0m")
 
-    def _wrapped_transcript(self, width):
-        """Wrap transcript lines to current width for display."""
-        out = []
-        for entry in self.transcript:
-            text, attr = entry[0], entry[1]
-            is_special = len(entry) > 2 and entry[2]
-            for line in _wrap(text, width - 1) if text else [""]:
-                out.append((line, attr, is_special) if is_special else (line, attr))
-        return out
-
-    def _input_layout(self, w):
-        first_cap, cont_cap = w - 3, max(w - 2, 1)
-        rows, row_starts = [], [0]
-        prefix, cap, line = ("❯ ", first_cap, "")
+    def _input_layout(self):
+        w = self.width
+        first_cap = w - 3
+        cont_cap = max(w - 2, 1)
+        rows = []
+        row_starts = [0]
+        prefix = "❯ "
+        cap = first_cap
+        line = ""
         for i, ch in enumerate(self.ibuf):
             if ch == "\n":
-                rows.append((prefix, line)); prefix, cap, line = "  ", cont_cap, ""
+                rows.append((prefix, line))
+                prefix, cap, line = "  ", cont_cap, ""
                 row_starts.append(i + 1)
             elif len(line) >= cap:
-                rows.append((prefix, line)); prefix, cap, line = "  ", cont_cap, ch
+                rows.append((prefix, line))
+                prefix, cap, line = "  ", cont_cap, ch
                 row_starts.append(i)
             else:
                 line += ch
         rows.append((prefix, line))
+        max_rows = max((self.height - 4) // 2, 1)
+        if len(rows) > max_rows:
+            rows = rows[:max_rows]
         crow = len(rows) - 1
         for r in range(len(rows) - 1):
-            if self.cpos < row_starts[r + 1]: crow = r; break
-        return rows, crow, 2 + self.cpos - row_starts[crow]
+            if self.cpos < row_starts[r + 1]:
+                crow = r; break
+        offset = self.cpos - row_starts[crow]
+        ccol = 3 + offset
+        return rows, crow, ccol
 
-    def _draw(self):
-        scr = self.scr
-        h, w = scr.getmaxyx()
-        scr.erase()
-        # Layout: transcript | input (n rows) | status
-        input_rows, crow, ccol = self._input_layout(w)
-        n_input = len(input_rows)
-        input_base = h - 1 - n_input
-        t_vis = input_base
-        # Draw transcript (wrapped to current width)
-        wrapped = self._wrapped_transcript(w)
-        start = max(0, len(wrapped) - t_vis - self.scroll)
-        for i in range(t_vis):
-            idx = start + i
-            if 0 <= idx < len(wrapped):
-                entry = wrapped[idx]
-                try: scr.addnstr(i, 0, entry[0], w - 1, entry[1])
-                except curses.error: pass
-        # Input
-        for i, (prefix, text) in enumerate(input_rows):
-            row = input_base + i
-            try: scr.addnstr(row, 0, prefix + text, w - 1)
-            except curses.error: pass
-        # Status bar
+    def _draw_status(self):
         cwd_short = os.path.basename(self.cwd) or self.cwd
-        parts = [f"model: {self.model}"]
-        if self.git_branch: parts.append(f"branch: {self.git_branch}")
-        parts.append(f"cwd: {cwd_short}")
+        d, r = "\033[2m", "\033[0m"
+        parts = [f" {d}model:{r} {self.model}"]
+        if self.git_branch:
+            parts.append(f"{d}branch:{r} {self.git_branch}")
+        parts.append(f"{d}cwd:{r} {cwd_short}")
         if self.tokens_in or self.tokens_out:
-            parts.append(f"tokens: {self.tokens_in + self.tokens_out:,}")
-        status = " | ".join(parts)
-        try: scr.addnstr(h - 1, 0, " " + status, w - 1, C_DIM)
-        except curses.error: pass
-        # Position cursor on input
-        try: scr.move(input_base + crow, min(ccol, w - 1))
-        except curses.error: pass
-        scr.refresh()
+            tok = f"{self.tokens_in + self.tokens_out:,}"
+            parts.append(f"{d}tokens:{r} {tok}")
+        s = f" {d}|{r} ".join(parts) + " "
+        _twrite(f"\033[{self.height};1H\033[2K{s}")
+
+    def _draw_input(self, input_rows, base_row):
+        for i, (prefix, text) in enumerate(input_rows):
+            row = base_row + i
+            _twrite(f"\033[{row};1H\033[2K{prefix}{text[:self.width - len(prefix)]}")
+
+    def _draw_transcript(self, t_bottom):
+        top = 1
+        vis = t_bottom - top + 1
+        if vis <= 0: return
+        start = max(0, len(self.lines) - vis - self.scroll)
+        for i in range(vis):
+            _twrite(f"\033[{top+i};1H\033[2K")
+            idx = start + i
+            if 0 <= idx < len(self.lines):
+                line = self.lines[idx]
+                for mk in ("___S___", "___SPIN___"):
+                    if line.startswith(mk): line = line[len(mk):]
+                _twrite(line[:self.width])
+
+    def _full_redraw(self):
+        self.height, self.width = _get_size()
+        input_rows, crow, ccol = self._input_layout()
+        n_input = len(input_rows)
+        # Layout: transcript | sep | input (n rows) | sep | status
+        # status = height, bottom sep = height-1, input = height-2-n+1..height-2
+        input_base = self.height - 1 - n_input
+        sep_top = input_base - 1
+        t_bottom = sep_top - 1
+        _twrite("\033[?25l")
+        _twrite(f"\033[1;{self.height}r")
+        _twrite("\033[2J")
+        self._draw_transcript(t_bottom)
+        self._rule(sep_top)
+        self._draw_input(input_rows, input_base)
+        self._rule(self.height - 1)
+        self._draw_status()
+        _twrite(f"\033[{input_base + crow};{ccol}H")
+        _twrite("\033[?25h")
+        _tflush(); self.redraw = False
+
+    def _append(self, styled):
+        self.lines.extend(styled)
+        if self.scroll == 0: self.redraw = True
 
     def _start_spinner(self):
         self._spinner = True
         self._spinner_frame = 0
         self._spinner_time = time.monotonic()
-        self._remove_spinner()
-        self.transcript.append((self._SPIN[0], C_DIM, True))
+        mk = "___SPIN___"
+        self.lines = [l for l in self.lines if not l.startswith(mk)]
+        self.lines.append(mk + f"\033[2m{self._SPIN[0]}\033[0m")
+        self.redraw = True
 
     def _stop_spinner(self):
-        if not self._spinner: return
+        if not self._spinner:
+            return
         self._spinner = False
-        self._remove_spinner()
-
-    def _remove_spinner(self):
-        self.transcript = [t for t in self.transcript if not (len(t) > 2 and t[2])]
+        mk = "___SPIN___"
+        self.lines = [l for l in self.lines if not l.startswith(mk)]
 
     def _tick_spinner(self):
-        if not self._spinner: return
+        if not self._spinner:
+            return
         now = time.monotonic()
-        if now - self._spinner_time < 0.08: return
+        if now - self._spinner_time < 0.08:
+            return
         self._spinner_time = now
         self._spinner_frame = (self._spinner_frame + 1) % len(self._SPIN)
-        self._remove_spinner()
-        self.transcript.append((self._SPIN[self._spinner_frame], C_DIM, True))
+        mk = "___SPIN___"
+        ch = self._SPIN[self._spinner_frame]
+        self.lines = [l for l in self.lines if not l.startswith(mk)]
+        self.lines.append(mk + f"\033[2m{ch}\033[0m")
+        self.redraw = True
 
     def _handle_event(self, ev):
         t = ev.get("type")
-        h, w = self.scr.getmaxyx()
         if t == "user_message":
-            self._add("")
-            for line in _wrap(f"You: {ev.get('content','')}", w - 1):
-                self._add(line, C_BOLD)
+            self._append([""])
+            self._append(_wrap(f"\033[1mYou:\033[0m {ev.get('content','')}", self.width))
             self._start_spinner()
         elif t == "assistant_text_delta":
             self._stop_spinner()
             self.cur_text += ev.get("text", "")
-            wrapped = _wrap("Cog: " + self.cur_text.lstrip("\n"), w - 1)
-            self.transcript = [e for e in self.transcript if not (len(e) > 2 and e[2] == "stream")]
-            for line in wrapped:
-                attr = C_BOLD if line.startswith("Cog:") else 0
-                self.transcript.append((line, attr, "stream"))
+            tag = "\033[1mCog:\033[0m "
+            new = _wrap(tag + self.cur_text.lstrip("\n"), self.width)
+            mk = "___S___"
+            self.lines = [l for l in self.lines if not l.startswith(mk)] + [mk + l for l in new]
+            if self.scroll == 0: self.redraw = True
         elif t == "assistant_text_final":
-            self.transcript = [e for e in self.transcript if not (len(e) > 2 and e[2] == "stream")]
-            for line in _wrap("Cog: " + self.cur_text.lstrip("\n"), w - 1):
-                self._add(line, C_BOLD if line.startswith("Cog:") else 0)
+            mk = "___S___"
+            self.lines = [l[len(mk):] if l.startswith(mk) else l for l in self.lines]
             self.cur_text = ""
         elif t == "tool_call":
             self._stop_spinner()
             s = _summarize_args(ev.get("input", {}))
-            for line in _wrap(f"> {ev.get('name','?')}({s})", w - 1):
-                self._add(line, C_CYAN)
+            self._append(_wrap(f"\033[36m> {ev.get('name','?')}({s})\033[0m", self.width))
             self._start_spinner()
         elif t == "tool_result":
             self._stop_spinner()
             o = ev.get("output", "")
             if ev.get("is_error"):
-                for line in _wrap(f"< ERROR: {o[:200]}", w - 1):
-                    self._add(line, C_RED)
+                self._append(_wrap(f"\033[31m< ERROR: {o[:200]}\033[0m", self.width))
             else:
-                self._add(f"< [{len(o.encode('utf-8',errors='replace'))} bytes]", C_DIM)
+                self._append([f"\033[2m< [{len(o.encode('utf-8',errors='replace'))} bytes]\033[0m"])
             self._start_spinner()
         elif t == "verbose":
             for line in ev.get("data", "").split("\n"):
-                self._add(f"  {line}", C_DIM)
+                self._append([f"\033[2m  {line}\033[0m"])
         elif t == "error":
             self._stop_spinner()
-            for line in _wrap(f"! {ev.get('message','')}", w - 1):
-                self._add(line, C_RED)
+            self._append(_wrap(f"\033[31m! {ev.get('message','')}\033[0m", self.width))
         elif t == "turn_complete":
             self._stop_spinner()
             usage = ev.get("usage", {})
@@ -669,124 +711,142 @@ class TUI:
             self._stop_spinner()
             name, inp = ev.get("name", "?"), ev.get("input", {})
             s = _summarize_args(inp)
-            self._add(f"? Allow {name}({s})? [y/n]", C_YELLOW)
-            self.approval = ev
+            self._append([f"\033[33m? Allow {name}({s})? [y/n]\033[0m"])
+            self.approval = ev; self.redraw = True
 
     def _handle_key(self, ch):
         if self.approval:
-            if ch == ord("y") or ch == ord("Y"):
-                self._add("  approved", C_YELLOW)
+            if ch in (b"y", b"Y"):
+                self._append(["\033[33m  approved\033[0m"])
                 self.iq.put({"type": "approval", "approved": True})
-            elif ch == ord("n") or ch == ord("N"):
-                self._add("  denied", C_YELLOW)
+            elif ch in (b"n", b"N"):
+                self._append(["\033[33m  denied\033[0m"])
                 self.iq.put({"type": "approval", "approved": False})
-            else: return
+            else:
+                return
             self.approval = None; self._start_spinner(); return
-        if ch in (curses.KEY_ENTER, 10, 13):
+        if ch in (b"\r", b"\n"):
             text = self.ibuf.strip()
             if text: self.ibuf = ""; self.cpos = 0; self.iq.put(text)
-        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            self.redraw = True
+        elif ch in (b"\x7f", b"\x08"):
             if self.cpos > 0:
                 self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
-                self.cpos -= 1
-        elif ch == 21:  # Ctrl+U
+                self.cpos -= 1; self.redraw = True
+        elif ch == b"\x15":
             nl = self.ibuf.rfind("\n", 0, self.cpos)
             start = nl + 1 if nl >= 0 else 0
             if start == self.cpos and self.cpos > 0:
+                # Already at line start — delete the newline to join with previous line
                 self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
                 self.cpos -= 1
             else:
                 self.ibuf = self.ibuf[:start] + self.ibuf[self.cpos:]
                 self.cpos = start
-        elif ch == 1: self.cpos = 0  # Ctrl+A
-        elif ch == 5: self.cpos = len(self.ibuf)  # Ctrl+E
-        elif ch == 3: raise KeyboardInterrupt  # Ctrl+C
-        elif ch == curses.KEY_LEFT:
-            if self.cpos > 0: self.cpos -= 1
-        elif ch == curses.KEY_RIGHT:
-            if self.cpos < len(self.ibuf): self.cpos += 1
-        elif ch == curses.KEY_HOME: self.cpos = 0
-        elif ch == curses.KEY_END: self.cpos = len(self.ibuf)
-        elif ch == curses.KEY_PPAGE:
-            h, w = self.scr.getmaxyx()
-            vis = h - 2
-            n_lines = len(self._wrapped_transcript(w))
-            self.scroll = min(self.scroll + vis, max(0, n_lines - vis))
-        elif ch == curses.KEY_NPAGE:
-            h, _ = self.scr.getmaxyx()
-            self.scroll = max(0, self.scroll - (h - 2))
-        elif ch == curses.KEY_MOUSE:
-            try:
-                _, _, _, _, bstate = curses.getmouse()
-                h, w = self.scr.getmaxyx()
-                n_lines = len(self._wrapped_transcript(w))
-                max_scroll = max(0, n_lines - (h - 2))
-                if bstate & 0x80000:       # scroll up
-                    self.scroll = min(self.scroll + 3, max_scroll)
-                elif bstate & 0x8000000:   # scroll down
-                    self.scroll = max(0, self.scroll - 3)
-            except curses.error: pass
-        elif ch == 27:  # ESC — read next for alt-key combos
-            self.scr.timeout(50)
-            ch2 = self.scr.getch()
-            self.scr.timeout(20)
-            if ch2 == ord("b"): self.cpos = self._word_left()
-            elif ch2 == ord("f"): self.cpos = self._word_right()
-            elif ch2 in (127, curses.KEY_BACKSPACE):  # Opt+Delete
-                wp = self._word_left()
-                self.ibuf = self.ibuf[:wp] + self.ibuf[self.cpos:]
-                self.cpos = wp
-            elif ch2 in (10, 13):  # Opt+Enter
-                self.ibuf = self.ibuf[:self.cpos] + "\n" + self.ibuf[self.cpos:]
-                self.cpos += 1
-            elif ch2 == 91:  # ESC [ — CSI sequence (Opt+arrows in some terminals)
-                self.scr.timeout(50)
-                ch3 = self.scr.getch()
-                if ch3 == 49:  # ESC [ 1 ; ...
-                    self.scr.getch()  # semicolon
-                    mod = self.scr.getch()  # modifier
-                    arrow = self.scr.getch()  # direction
-                    if mod == 51:  # Opt modifier (3)
-                        if arrow == 68: self.cpos = self._word_left()   # Left
-                        elif arrow == 67: self.cpos = self._word_right()  # Right
-                self.scr.timeout(20)
-        elif 32 <= ch < 127:
-            self.ibuf = self.ibuf[:self.cpos] + chr(ch) + self.ibuf[self.cpos:]
-            self.cpos += 1
+            self.redraw = True
+        elif ch == b"\x01":
+            self.cpos = 0; self.redraw = True
+        elif ch == b"\x05":
+            self.cpos = len(self.ibuf); self.redraw = True
+        elif ch == b"\x03": self.running = False
+        elif ch == b"\x0c": self.redraw = True
+        elif ch == b"\x1b": self._esc()
+        elif ch and ch[0:1].isascii() and ch[0] >= 32:
+            c = ch.decode("utf-8", errors="replace")
+            self.ibuf = self.ibuf[:self.cpos] + c + self.ibuf[self.cpos:]
+            self.cpos += 1; self.redraw = True
 
     def _word_left(self):
         i = self.cpos
-        if i > 0 and self.ibuf[i - 1] == "\n": return i - 1
-        while i > 0 and not self.ibuf[i - 1].isalnum() and self.ibuf[i - 1] != "\n": i -= 1
-        while i > 0 and self.ibuf[i - 1].isalnum(): i -= 1
+        if i > 0 and self.ibuf[i - 1] == "\n":
+            return i - 1
+        while i > 0 and not self.ibuf[i - 1].isalnum() and self.ibuf[i - 1] != "\n":
+            i -= 1
+        while i > 0 and self.ibuf[i - 1].isalnum():
+            i -= 1
         return i
 
     def _word_right(self):
         i, n = self.cpos, len(self.ibuf)
-        while i < n and not self.ibuf[i].isalnum(): i += 1
-        while i < n and self.ibuf[i].isalnum(): i += 1
+        while i < n and not self.ibuf[i].isalnum():
+            i += 1
+        while i < n and self.ibuf[i].isalnum():
+            i += 1
         return i
 
+    def _esc(self):
+        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not r: return
+        ch2 = os.read(_fd, 1)
+        if ch2 in (b"\r", b"\n"):
+            self.ibuf = self.ibuf[:self.cpos] + "\n" + self.ibuf[self.cpos:]
+            self.cpos += 1; self.redraw = True; return
+        elif ch2 == b"b":
+            self.cpos = self._word_left(); self.redraw = True; return
+        elif ch2 == b"f":
+            self.cpos = self._word_right(); self.redraw = True; return
+        elif ch2 == b"\x7f":
+            wp = self._word_left()
+            self.ibuf = self.ibuf[:wp] + self.ibuf[self.cpos:]
+            self.cpos = wp; self.redraw = True; return
+        if ch2 != b"[": return
+        seq = b""
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not r: break
+            b = os.read(_fd, 1); seq += b
+            if b == b"<":
+                continue
+            if b and b[0] >= 0x40: break
+        # SGR mouse: <button;col;rowM or <button;col;rowm
+        if seq.startswith(b"<") and (seq.endswith(b"M") or seq.endswith(b"m")):
+            parts = seq[1:-1].split(b";")
+            if len(parts) >= 1:
+                btn = int(parts[0])
+                scroll_lines = 3
+                if btn == 64:
+                    self.scroll = min(self.scroll + scroll_lines,
+                                      max(0, len(self.lines) - (self.height - 5)))
+                    self.redraw = True
+                elif btn == 65:
+                    self.scroll = max(0, self.scroll - scroll_lines)
+                    self.redraw = True
+            return
+        if seq == b"D":
+            if self.cpos > 0: self.cpos -= 1; self.redraw = True
+        elif seq == b"C":
+            if self.cpos < len(self.ibuf): self.cpos += 1; self.redraw = True
+        elif seq in (b"H", b"1~"):
+            self.cpos = 0; self.redraw = True
+        elif seq in (b"F", b"4~"):
+            self.cpos = len(self.ibuf); self.redraw = True
+        elif seq == b"1;3D":
+            self.cpos = self._word_left(); self.redraw = True
+        elif seq == b"1;3C":
+            self.cpos = self._word_right(); self.redraw = True
+        elif seq == b"5~":
+            vis = self.height - 5
+            self.scroll = min(self.scroll + vis, max(0, len(self.lines) - vis))
+            self.redraw = True
+        elif seq == b"6~":
+            vis = self.height - 5
+            self.scroll = max(0, self.scroll - vis); self.redraw = True
+
     def run(self):
-        def _main(stdscr):
-            self.scr = stdscr
-            _init_colors()
-            curses.curs_set(1)
-            curses.mousemask(curses.ALL_MOUSE_EVENTS)
-            stdscr.keypad(True)
-            stdscr.timeout(20)
-            while True:
+        _set_cbreak(); atexit.register(_restore_term); _enter_alt()
+        signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "redraw", True))
+        try:
+            self._full_redraw()
+            while self.running:
                 while True:
                     try: self._handle_event(self.eq.get_nowait())
                     except Exception: break
-                ch = stdscr.getch()
-                if ch != -1: self._handle_key(ch)
+                r, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if r: self._handle_key(os.read(_fd, 1))
                 self._tick_spinner()
-                self._draw()
-        try:
-            curses.wrapper(_main)
-        except KeyboardInterrupt:
-            pass
+                if self.redraw: self._full_redraw()
+        finally:
+            _restore_term()
 
 # --- Config & Main ---
 
@@ -868,6 +928,12 @@ def _load_skills(dirs):
     return skills
 
 def main():
+    if sys.platform not in ("darwin", "linux"):
+        print(f"Error: unsupported platform '{sys.platform}'. Requires macOS or Linux.", file=sys.stderr)
+        raise SystemExit(1)
+    if sys.version_info < (3, 9):
+        print(f"Error: requires Python 3.9+, got {sys.version}", file=sys.stderr)
+        raise SystemExit(1)
     ap = argparse.ArgumentParser(description="cog - minimal coding agent")
     ap.add_argument("--config", default="~/.cog/config.json")
     ap.add_argument("--cwd", default=".")
