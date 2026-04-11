@@ -698,8 +698,14 @@ class TUI:
         elif ch == b"\x15":
             nl = self.ibuf.rfind("\n", 0, self.cpos)
             start = nl + 1 if nl >= 0 else 0
-            self.ibuf = self.ibuf[:start] + self.ibuf[self.cpos:]
-            self.cpos = start; self.redraw = True
+            if start == self.cpos and self.cpos > 0:
+                # Already at line start — delete the newline to join with previous line
+                self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
+                self.cpos -= 1
+            else:
+                self.ibuf = self.ibuf[:start] + self.ibuf[self.cpos:]
+                self.cpos = start
+            self.redraw = True
         elif ch == b"\x01":
             self.cpos = 0; self.redraw = True
         elif ch == b"\x05":
@@ -714,7 +720,9 @@ class TUI:
 
     def _word_left(self):
         i = self.cpos
-        while i > 0 and not self.ibuf[i - 1].isalnum():
+        if i > 0 and self.ibuf[i - 1] == "\n":
+            return i - 1
+        while i > 0 and not self.ibuf[i - 1].isalnum() and self.ibuf[i - 1] != "\n":
             i -= 1
         while i > 0 and self.ibuf[i - 1].isalnum():
             i -= 1
