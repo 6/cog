@@ -564,26 +564,57 @@ class TUI:
     def _rule(self, row):
         _twrite(f"\033[{row};1H\033[2K\033[36m{'─' * self.width}\033[0m")
 
+    def _input_layout(self):
+        w = self.width
+        first_cap = w - 3
+        cont_cap = max(w - 2, 1)
+        rows = []
+        row_starts = [0]
+        prefix = "❯ "
+        cap = first_cap
+        line = ""
+        for i, ch in enumerate(self.ibuf):
+            if ch == "\n":
+                rows.append((prefix, line))
+                prefix, cap, line = "  ", cont_cap, ""
+                row_starts.append(i + 1)
+            elif len(line) >= cap:
+                rows.append((prefix, line))
+                prefix, cap, line = "  ", cont_cap, ch
+                row_starts.append(i)
+            else:
+                line += ch
+        rows.append((prefix, line))
+        max_rows = max((self.height - 4) // 2, 1)
+        if len(rows) > max_rows:
+            rows = rows[:max_rows]
+        crow = len(rows) - 1
+        for r in range(len(rows) - 1):
+            if self.cpos < row_starts[r + 1]:
+                crow = r; break
+        offset = self.cpos - row_starts[crow]
+        ccol = 3 + offset
+        return rows, crow, ccol
+
     def _draw_status(self):
         cwd_short = os.path.basename(self.cwd) or self.cwd
-        s = f" model: {self.model} | cwd: {cwd_short} | tools: {self.tool_count} "
-        _twrite(f"\033[{self.height};1H\033[2K\033[7m{s[:self.width].ljust(self.width)}\033[0m")
+        d = "\033[2m"
+        r = "\033[0m"
+        s = f" {d}model:{r} {self.model} {d}|{r} {d}cwd:{r} {cwd_short} {d}|{r} {d}tools:{r} {self.tool_count} "
+        _twrite(f"\033[{self.height};1H\033[2K{s}")
 
-    def _draw_input(self):
-        _twrite(f"\033[{self.height-2};1H\033[2K")
+    def _draw_input(self, input_rows, base_row):
+        for i, (prefix, text) in enumerate(input_rows):
+            row = base_row + i
+            _twrite(f"\033[{row};1H\033[2K{prefix}{text[:self.width - len(prefix)]}")
         if self.approval:
             name, inp = self.approval.get("name", "?"), self.approval.get("input", {})
+            _twrite(f"\033[{base_row};1H\033[2K")
             _twrite(f"\033[33mAllow {name}({_summarize_args(inp)})? [y/n] \033[0m")
-        else:
-            prefix = "❯ "
-            vis = self.ibuf[:self.width - 3]
-            _twrite(prefix + vis)
-            col = 3 + min(self.cpos, self.width - 3)
-            _twrite(f"\033[{self.height-2};{col}H")
 
-    def _draw_transcript(self):
-        top, bottom = 1, self.height - 4
-        vis = bottom - top + 1
+    def _draw_transcript(self, t_bottom):
+        top = 1
+        vis = t_bottom - top + 1
         if vis <= 0: return
         start = max(0, len(self.lines) - vis - self.scroll)
         for i in range(vis):
@@ -594,15 +625,22 @@ class TUI:
 
     def _full_redraw(self):
         self.height, self.width = _get_size()
+        input_rows, crow, ccol = self._input_layout()
+        n_input = len(input_rows)
+        # Layout: transcript | sep | input (n rows) | sep | status
+        # status = height, bottom sep = height-1, input = height-2-n+1..height-2
+        input_base = self.height - 1 - n_input
+        sep_top = input_base - 1
+        t_bottom = sep_top - 1
         _twrite("\033[?25l")
         _twrite(f"\033[1;{self.height}r")
         _twrite("\033[2J")
-        self._draw_transcript()
-        self._rule(self.height - 3)
-        self._draw_input()
+        self._draw_transcript(t_bottom)
+        self._rule(sep_top)
+        self._draw_input(input_rows, input_base)
         self._rule(self.height - 1)
         self._draw_status()
-        _twrite(f"\033[{self.height-2};{3 + min(self.cpos, self.width-3)}H")
+        _twrite(f"\033[{input_base + crow};{ccol}H")
         _twrite("\033[?25h")
         _tflush(); self.redraw = False
 
@@ -657,6 +695,11 @@ class TUI:
             if self.cpos > 0:
                 self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
                 self.cpos -= 1; self.redraw = True
+        elif ch == b"\x15":
+            nl = self.ibuf.rfind("\n", 0, self.cpos)
+            start = nl + 1 if nl >= 0 else 0
+            self.ibuf = self.ibuf[:start] + self.ibuf[self.cpos:]
+            self.cpos = start; self.redraw = True
         elif ch == b"\x01":
             self.cpos = 0; self.redraw = True
         elif ch == b"\x05":
@@ -690,7 +733,10 @@ class TUI:
         r, _, _ = select.select([sys.stdin], [], [], 0.05)
         if not r: return
         ch2 = os.read(_fd, 1)
-        if ch2 == b"b":
+        if ch2 in (b"\r", b"\n"):
+            self.ibuf = self.ibuf[:self.cpos] + "\n" + self.ibuf[self.cpos:]
+            self.cpos += 1; self.redraw = True; return
+        elif ch2 == b"b":
             self.cpos = self._word_left(); self.redraw = True; return
         elif ch2 == b"f":
             self.cpos = self._word_right(); self.redraw = True; return
