@@ -466,18 +466,6 @@ class Agent:
 _original_termios = None
 _fd = None
 
-def _twrite(s):
-    sys.stdout.write(s)
-
-def _tflush():
-    sys.stdout.flush()
-
-def _enter_alt():
-    _twrite("\033[2J\033[H\033[?1000h\033[?1006h"); _tflush()
-
-def _exit_alt():
-    _twrite("\033[?1006l\033[?1000l"); _tflush()
-
 def _set_cbreak():
     global _original_termios, _fd
     import termios, tty
@@ -492,20 +480,7 @@ def _restore_term():
         try: termios.tcsetattr(_fd, termios.TCSADRAIN, _original_termios)
         except Exception: pass
         _original_termios = None
-    _twrite("\033[?25h\033[r"); _tflush()
-
-def _get_size():
-    try:
-        c, r = os.get_terminal_size(); return max(r, 5), max(c, 20)
-    except OSError:
-        return 24, 80
-
-def _wrap(text, width):
-    lines = []
-    for raw in text.split("\n"):
-        if not raw: lines.append("")
-        else: lines.extend(textwrap.wrap(raw, width, break_on_hyphens=False) or [""])
-    return lines
+    sys.stdout.write("\033[?25h"); sys.stdout.flush()
 
 def _summarize_args(args, max_len=60):
     if not args: return ""
@@ -527,34 +502,66 @@ def _git_branch(cwd):
         pass
     return None
 
+def _out(s=""):
+    sys.stdout.write(s + "\n"); sys.stdout.flush()
+
+def _out_inline(s):
+    sys.stdout.write(s); sys.stdout.flush()
+
 class TUI:
-    def __init__(self, event_queue, input_queue, model="", cwd="", tool_count=0):
+    def __init__(self, event_queue, input_queue, model="", cwd="", tool_count=0,
+                 token_threshold_warn=100000, token_threshold_danger=200000):
         self.eq, self.iq = event_queue, input_queue
         self.model, self.cwd, self.tool_count = model, cwd, tool_count
+        self.token_threshold_warn, self.token_threshold_danger = token_threshold_warn, token_threshold_danger
         self.git_branch = _git_branch(cwd)
-        self.tokens_in = 0
-        self.tokens_out = 0
-        self.lines, self.ibuf, self.cpos = [], "", 0
-        self.scroll, self.redraw, self.running = 0, True, True
-        self.height, self.width = 24, 80
-        self.cur_text, self.approval = "", None
+        self.tokens_in = self.tokens_out = 0
+        self.ibuf, self.cpos = "", 0
+        self.running = True
+        self.approval = None
         self._spinner = False
         self._spinner_frame = 0
         self._spinner_time = 0.0
         self._SPIN = "⠷⠯⠻⠽⠾"
+        self._spin_line_active = False
 
-    def _rule(self, row):
-        _twrite(f"\033[{row};1H\033[2K\033[36m{'─' * self.width}\033[0m")
+    def _prompt_prefix(self):
+        cwd_short = os.path.basename(self.cwd) or self.cwd
+        # cwd in bold, # dim, branch in cyan
+        if self.git_branch:
+            prefix = f"\033[1m{cwd_short}\033[2m#\033[0m\033[36m{self.git_branch}\033[0m"
+        else:
+            prefix = f"\033[1m{cwd_short}\033[0m"
+        return prefix
+
+    def _caret(self):
+        tok = self.tokens_in + self.tokens_out
+        if tok >= self.token_threshold_danger: return "\033[31m❯\033[0m"   # red
+        if tok >= self.token_threshold_warn:   return "\033[33m❯\033[0m"   # yellow
+        return "❯"
+
+    def _banner(self):
+        d, r = "\033[2m", "\033[0m"
+        _out(f"""
+{d}█▀▀ █▀█ █▀▀
+█   █ █ █ █
+▀▀▀ ▀▀▀ ▀▀▀{r}
+{d}model:{r} {self.model}
+""")
+
 
     def _input_layout(self):
-        w = self.width
-        first_cap = w - 3
-        cont_cap = max(w - 2, 1)
-        rows = []
-        row_starts = [0]
-        prefix = "❯ "
-        cap = first_cap
-        line = ""
+        try:
+            w = os.get_terminal_size().columns
+        except OSError:
+            w = 80
+        cwd_short = os.path.basename(self.cwd) or self.cwd
+        plain_pfx = f"{cwd_short}#{self.git_branch} ❯ " if self.git_branch else f"{cwd_short} ❯ "
+        styled_pfx = f"{self._prompt_prefix()} {self._caret()} "
+        pfx_len = len(plain_pfx)
+        first_cap, cont_cap = w - pfx_len - 1, max(w - 2, 1)
+        rows, row_starts = [], [0]
+        prefix, cap, line = styled_pfx, first_cap, ""
         for i, ch in enumerate(self.ibuf):
             if ch == "\n":
                 rows.append((prefix, line))
@@ -567,141 +574,95 @@ class TUI:
             else:
                 line += ch
         rows.append((prefix, line))
-        max_rows = max((self.height - 4) // 2, 1)
-        if len(rows) > max_rows:
-            rows = rows[:max_rows]
         crow = len(rows) - 1
         for r in range(len(rows) - 1):
             if self.cpos < row_starts[r + 1]:
                 crow = r; break
-        offset = self.cpos - row_starts[crow]
-        ccol = 3 + offset
-        return rows, crow, ccol
+        pfx_w = len(rows[crow][0]) if rows else pfx_len
+        return rows, crow, pfx_w + self.cpos - row_starts[crow]
 
-    def _draw_status(self):
-        cwd_short = os.path.basename(self.cwd) or self.cwd
-        d, r = "\033[2m", "\033[0m"
-        parts = [f" {d}model:{r} {self.model}"]
-        if self.git_branch:
-            parts.append(f"{d}branch:{r} {self.git_branch}")
-        parts.append(f"{d}cwd:{r} {cwd_short}")
-        if self.tokens_in or self.tokens_out:
-            tok = f"{self.tokens_in + self.tokens_out:,}"
-            parts.append(f"{d}tokens:{r} {tok}")
-        s = f" {d}|{r} ".join(parts) + " "
-        _twrite(f"\033[{self.height};1H\033[2K{s}")
+    def _draw_input(self):
+        rows, crow, ccol = self._input_layout()
+        sys.stdout.write("\033[?25l")
+        # Clear current line and draw all input rows
+        sys.stdout.write("\r\033[2K")
+        for i, (prefix, text) in enumerate(rows):
+            if i > 0:
+                sys.stdout.write("\n\033[2K")
+            sys.stdout.write(prefix + text)
+        # Move cursor to the right position
+        up = len(rows) - 1 - crow
+        if up > 0:
+            sys.stdout.write(f"\033[{up}A")
+        sys.stdout.write(f"\r\033[{ccol}C")
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+        self._drawn_rows = len(rows)
 
-    def _draw_input(self, input_rows, base_row):
-        for i, (prefix, text) in enumerate(input_rows):
-            row = base_row + i
-            _twrite(f"\033[{row};1H\033[2K{prefix}{text[:self.width - len(prefix)]}")
+    def _clear_input(self):
+        n = getattr(self, "_drawn_rows", 1)
+        sys.stdout.write("\r\033[2K")
+        for _ in range(n - 1):
+            sys.stdout.write("\033[1B\033[2K")
+        if n > 1:
+            sys.stdout.write(f"\033[{n - 1}A")
+        sys.stdout.write("\r")
+        sys.stdout.flush()
 
-    def _draw_transcript(self, t_bottom):
-        top = 1
-        vis = t_bottom - top + 1
-        if vis <= 0: return
-        start = max(0, len(self.lines) - vis - self.scroll)
-        for i in range(vis):
-            _twrite(f"\033[{top+i};1H\033[2K")
-            idx = start + i
-            if 0 <= idx < len(self.lines):
-                line = self.lines[idx]
-                for mk in ("___S___", "___SPIN___"):
-                    if line.startswith(mk): line = line[len(mk):]
-                _twrite(line[:self.width])
-
-    def _full_redraw(self):
-        self.height, self.width = _get_size()
-        input_rows, crow, ccol = self._input_layout()
-        n_input = len(input_rows)
-        # Layout: transcript | sep | input (n rows) | sep | status
-        # status = height, bottom sep = height-1, input = height-2-n+1..height-2
-        input_base = self.height - 1 - n_input
-        sep_top = input_base - 1
-        t_bottom = sep_top - 1
-        _twrite("\033[?25l")
-        _twrite(f"\033[1;{self.height}r")
-        _twrite("\033[2J")
-        self._draw_transcript(t_bottom)
-        self._rule(sep_top)
-        self._draw_input(input_rows, input_base)
-        self._rule(self.height - 1)
-        self._draw_status()
-        _twrite(f"\033[{input_base + crow};{ccol}H")
-        _twrite("\033[?25h")
-        _tflush(); self.redraw = False
-
-    def _append(self, styled):
-        self.lines.extend(styled)
-        if self.scroll == 0: self.redraw = True
+    def _clear_spinner(self):
+        if self._spin_line_active:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            self._spin_line_active = False
 
     def _start_spinner(self):
         self._spinner = True
         self._spinner_frame = 0
         self._spinner_time = time.monotonic()
-        mk = "___SPIN___"
-        self.lines = [l for l in self.lines if not l.startswith(mk)]
-        self.lines.append(mk + f"\033[2m{self._SPIN[0]}\033[0m")
-        self.redraw = True
 
     def _stop_spinner(self):
-        if not self._spinner:
-            return
+        if not self._spinner: return
         self._spinner = False
-        mk = "___SPIN___"
-        self.lines = [l for l in self.lines if not l.startswith(mk)]
+        self._clear_spinner()
 
     def _tick_spinner(self):
-        if not self._spinner:
-            return
+        if not self._spinner: return
         now = time.monotonic()
-        if now - self._spinner_time < 0.08:
-            return
+        if now - self._spinner_time < 0.08: return
         self._spinner_time = now
         self._spinner_frame = (self._spinner_frame + 1) % len(self._SPIN)
-        mk = "___SPIN___"
         ch = self._SPIN[self._spinner_frame]
-        self.lines = [l for l in self.lines if not l.startswith(mk)]
-        self.lines.append(mk + f"\033[2m{ch}\033[0m")
-        self.redraw = True
+        sys.stdout.write(f"\r\033[2K\033[2m{ch}\033[0m")
+        sys.stdout.flush()
+        self._spin_line_active = True
 
     def _handle_event(self, ev):
         t = ev.get("type")
         if t == "user_message":
-            self._append([""])
-            self._append(_wrap(f"\033[1mYou:\033[0m {ev.get('content','')}", self.width))
-            self._start_spinner()
+            pass  # already printed by submit handler
         elif t == "assistant_text_delta":
             self._stop_spinner()
-            self.cur_text += ev.get("text", "")
-            tag = "\033[1mCog:\033[0m "
-            new = _wrap(tag + self.cur_text.lstrip("\n"), self.width)
-            mk = "___S___"
-            self.lines = [l for l in self.lines if not l.startswith(mk)] + [mk + l for l in new]
-            if self.scroll == 0: self.redraw = True
+            _out_inline(ev.get("text", ""))
         elif t == "assistant_text_final":
-            mk = "___S___"
-            self.lines = [l[len(mk):] if l.startswith(mk) else l for l in self.lines]
-            self.cur_text = ""
+            _out("")  # newline after streaming
         elif t == "tool_call":
             self._stop_spinner()
             s = _summarize_args(ev.get("input", {}))
-            self._append(_wrap(f"\033[36m> {ev.get('name','?')}({s})\033[0m", self.width))
-            self._start_spinner()
+            _out(f"\033[36m> {ev.get('name','?')}({s})\033[0m")
         elif t == "tool_result":
             self._stop_spinner()
             o = ev.get("output", "")
             if ev.get("is_error"):
-                self._append(_wrap(f"\033[31m< ERROR: {o[:200]}\033[0m", self.width))
+                _out(f"\033[31m< ERROR: {o[:200]}\033[0m")
             else:
-                self._append([f"\033[2m< [{len(o.encode('utf-8',errors='replace'))} bytes]\033[0m"])
+                _out(f"\033[2m< [{len(o.encode('utf-8',errors='replace'))} bytes]\033[0m")
             self._start_spinner()
         elif t == "verbose":
             for line in ev.get("data", "").split("\n"):
-                self._append([f"\033[2m  {line}\033[0m"])
+                _out(f"\033[2m  {line}\033[0m")
         elif t == "error":
             self._stop_spinner()
-            self._append(_wrap(f"\033[31m! {ev.get('message','')}\033[0m", self.width))
+            _out(f"\033[31m! {ev.get('message','')}\033[0m")
         elif t == "turn_complete":
             self._stop_spinner()
             usage = ev.get("usage", {})
@@ -711,67 +672,63 @@ class TUI:
             self._stop_spinner()
             name, inp = ev.get("name", "?"), ev.get("input", {})
             s = _summarize_args(inp)
-            self._append([f"\033[33m? Allow {name}({s})? [y/n]\033[0m"])
-            self.approval = ev; self.redraw = True
+            _out(f"\033[33m? Allow {name}({s})? [y/n]\033[0m")
+            self.approval = ev
 
     def _handle_key(self, ch):
         if self.approval:
             if ch in (b"y", b"Y"):
-                self._append(["\033[33m  approved\033[0m"])
+                _out("\033[33m  approved\033[0m")
                 self.iq.put({"type": "approval", "approved": True})
             elif ch in (b"n", b"N"):
-                self._append(["\033[33m  denied\033[0m"])
+                _out("\033[33m  denied\033[0m")
                 self.iq.put({"type": "approval", "approved": False})
-            else:
-                return
+            else: return
             self.approval = None; self._start_spinner(); return
         if ch in (b"\r", b"\n"):
             text = self.ibuf.strip()
-            if text: self.ibuf = ""; self.cpos = 0; self.iq.put(text)
-            self.redraw = True
+            if text:
+                self._clear_input()
+                _out(f"\n{self._prompt_prefix()} {self._caret()} {text}")
+                _out("")
+                self.ibuf, self.cpos = "", 0
+                self.iq.put(text)
+                self._start_spinner()
+                return
         elif ch in (b"\x7f", b"\x08"):
             if self.cpos > 0:
                 self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
-                self.cpos -= 1; self.redraw = True
+                self.cpos -= 1
         elif ch == b"\x15":
             nl = self.ibuf.rfind("\n", 0, self.cpos)
             start = nl + 1 if nl >= 0 else 0
             if start == self.cpos and self.cpos > 0:
-                # Already at line start — delete the newline to join with previous line
                 self.ibuf = self.ibuf[:self.cpos-1] + self.ibuf[self.cpos:]
                 self.cpos -= 1
             else:
                 self.ibuf = self.ibuf[:start] + self.ibuf[self.cpos:]
                 self.cpos = start
-            self.redraw = True
-        elif ch == b"\x01":
-            self.cpos = 0; self.redraw = True
-        elif ch == b"\x05":
-            self.cpos = len(self.ibuf); self.redraw = True
-        elif ch == b"\x03": self.running = False
-        elif ch == b"\x0c": self.redraw = True
-        elif ch == b"\x1b": self._esc()
+        elif ch == b"\x01": self.cpos = 0
+        elif ch == b"\x05": self.cpos = len(self.ibuf)
+        elif ch == b"\x03": self.running = False; return
+        elif ch == b"\x1b": self._esc(); self._draw_input(); return
         elif ch and ch[0:1].isascii() and ch[0] >= 32:
             c = ch.decode("utf-8", errors="replace")
             self.ibuf = self.ibuf[:self.cpos] + c + self.ibuf[self.cpos:]
-            self.cpos += 1; self.redraw = True
+            self.cpos += 1
+        self._draw_input()
 
     def _word_left(self):
         i = self.cpos
-        if i > 0 and self.ibuf[i - 1] == "\n":
-            return i - 1
-        while i > 0 and not self.ibuf[i - 1].isalnum() and self.ibuf[i - 1] != "\n":
-            i -= 1
-        while i > 0 and self.ibuf[i - 1].isalnum():
-            i -= 1
+        if i > 0 and self.ibuf[i - 1] == "\n": return i - 1
+        while i > 0 and not self.ibuf[i - 1].isalnum() and self.ibuf[i - 1] != "\n": i -= 1
+        while i > 0 and self.ibuf[i - 1].isalnum(): i -= 1
         return i
 
     def _word_right(self):
         i, n = self.cpos, len(self.ibuf)
-        while i < n and not self.ibuf[i].isalnum():
-            i += 1
-        while i < n and self.ibuf[i].isalnum():
-            i += 1
+        while i < n and not self.ibuf[i].isalnum(): i += 1
+        while i < n and self.ibuf[i].isalnum(): i += 1
         return i
 
     def _esc(self):
@@ -780,73 +737,45 @@ class TUI:
         ch2 = os.read(_fd, 1)
         if ch2 in (b"\r", b"\n"):
             self.ibuf = self.ibuf[:self.cpos] + "\n" + self.ibuf[self.cpos:]
-            self.cpos += 1; self.redraw = True; return
-        elif ch2 == b"b":
-            self.cpos = self._word_left(); self.redraw = True; return
-        elif ch2 == b"f":
-            self.cpos = self._word_right(); self.redraw = True; return
+            self.cpos += 1
+        elif ch2 == b"b": self.cpos = self._word_left()
+        elif ch2 == b"f": self.cpos = self._word_right()
         elif ch2 == b"\x7f":
             wp = self._word_left()
             self.ibuf = self.ibuf[:wp] + self.ibuf[self.cpos:]
-            self.cpos = wp; self.redraw = True; return
-        if ch2 != b"[": return
-        seq = b""
-        while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if not r: break
-            b = os.read(_fd, 1); seq += b
-            if b == b"<":
-                continue
-            if b and b[0] >= 0x40: break
-        # SGR mouse: <button;col;rowM or <button;col;rowm
-        if seq.startswith(b"<") and (seq.endswith(b"M") or seq.endswith(b"m")):
-            parts = seq[1:-1].split(b";")
-            if len(parts) >= 1:
-                btn = int(parts[0])
-                scroll_lines = 3
-                if btn == 64:
-                    self.scroll = min(self.scroll + scroll_lines,
-                                      max(0, len(self.lines) - (self.height - 5)))
-                    self.redraw = True
-                elif btn == 65:
-                    self.scroll = max(0, self.scroll - scroll_lines)
-                    self.redraw = True
-            return
-        if seq == b"D":
-            if self.cpos > 0: self.cpos -= 1; self.redraw = True
-        elif seq == b"C":
-            if self.cpos < len(self.ibuf): self.cpos += 1; self.redraw = True
-        elif seq in (b"H", b"1~"):
-            self.cpos = 0; self.redraw = True
-        elif seq in (b"F", b"4~"):
-            self.cpos = len(self.ibuf); self.redraw = True
-        elif seq == b"1;3D":
-            self.cpos = self._word_left(); self.redraw = True
-        elif seq == b"1;3C":
-            self.cpos = self._word_right(); self.redraw = True
-        elif seq == b"5~":
-            vis = self.height - 5
-            self.scroll = min(self.scroll + vis, max(0, len(self.lines) - vis))
-            self.redraw = True
-        elif seq == b"6~":
-            vis = self.height - 5
-            self.scroll = max(0, self.scroll - vis); self.redraw = True
+            self.cpos = wp
+        elif ch2 == b"[":
+            seq = b""
+            while True:
+                r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not r: break
+                b = os.read(_fd, 1); seq += b
+                if b and b[0] >= 0x40: break
+            if seq == b"D" and self.cpos > 0: self.cpos -= 1
+            elif seq == b"C" and self.cpos < len(self.ibuf): self.cpos += 1
+            elif seq in (b"H", b"1~"): self.cpos = 0
+            elif seq in (b"F", b"4~"): self.cpos = len(self.ibuf)
+            elif seq == b"1;3D": self.cpos = self._word_left()
+            elif seq == b"1;3C": self.cpos = self._word_right()
 
     def run(self):
-        _set_cbreak(); atexit.register(_restore_term); _enter_alt()
-        signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "redraw", True))
+        _set_cbreak(); atexit.register(_restore_term)
+        self._banner()
         try:
-            self._full_redraw()
+            self._draw_input()
             while self.running:
                 while True:
-                    try: self._handle_event(self.eq.get_nowait())
+                    try:
+                        ev = self.eq.get_nowait()
+                        self._clear_spinner()
+                        self._handle_event(ev)
                     except Exception: break
                 r, _, _ = select.select([sys.stdin], [], [], 0.02)
                 if r: self._handle_key(os.read(_fd, 1))
                 self._tick_spinner()
-                if self.redraw: self._full_redraw()
         finally:
             _restore_term()
+            print()
 
 # --- Config & Main ---
 
@@ -863,6 +792,8 @@ class Config:
     log_dir: str = "~/.cog/logs"
     auto_approve: bool = False
     verbose: bool = False
+    token_threshold_warn: int = 100000
+    token_threshold_danger: int = 200000
     # Set at runtime, not from config file
     api_key: str = ""
     system_prompt: str = ""
@@ -968,7 +899,8 @@ def main():
     eq, iq = queue.Queue(), queue.Queue()
     agent = Agent(cfg, tool_reg, eq, iq)
     threading.Thread(target=agent.worker_loop, daemon=True).start()
-    TUI(eq, iq, model=cfg.model, cwd=cwd, tool_count=len(tool_reg)).run()
+    TUI(eq, iq, model=cfg.model, cwd=cwd, tool_count=len(tool_reg),
+        token_threshold_warn=cfg.token_threshold_warn, token_threshold_danger=cfg.token_threshold_danger).run()
     iq.put(None)
 
 if __name__ == "__main__":
