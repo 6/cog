@@ -515,10 +515,10 @@ def _tflush():
     sys.stdout.flush()
 
 def _enter_alt():
-    _twrite("\033[2J\033[H"); _tflush()
+    _twrite("\033[2J\033[H\033[?1000h\033[?1006h"); _tflush()
 
 def _exit_alt():
-    pass
+    _twrite("\033[?1006l\033[?1000l"); _tflush()
 
 def _set_cbreak():
     global _original_termios, _fd
@@ -563,10 +563,24 @@ def _summarize_args(args, max_len=60):
     return r[:max_len - 3] + "..." if len(r) > max_len else r
 
 
+def _git_branch(cwd):
+    try:
+        r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=2, cwd=cwd)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 class TUI:
     def __init__(self, event_queue, input_queue, model="", cwd="", tool_count=0):
         self.eq, self.iq = event_queue, input_queue
         self.model, self.cwd, self.tool_count = model, cwd, tool_count
+        self.git_branch = _git_branch(cwd)
+        self.tokens_in = 0
+        self.tokens_out = 0
         self.lines, self.ibuf, self.cpos = [], "", 0
         self.scroll, self.redraw, self.running = 0, True, True
         self.height, self.width = 24, 80
@@ -574,7 +588,7 @@ class TUI:
         self._spinner = False
         self._spinner_frame = 0
         self._spinner_time = 0.0
-        self._SPIN = "⠾⠽⠻⠯⠷"
+        self._SPIN = "⠷⠯⠻⠽⠾"
 
     def _rule(self, row):
         _twrite(f"\033[{row};1H\033[2K\033[36m{'─' * self.width}\033[0m")
@@ -613,19 +627,21 @@ class TUI:
 
     def _draw_status(self):
         cwd_short = os.path.basename(self.cwd) or self.cwd
-        d = "\033[2m"
-        r = "\033[0m"
-        s = f" {d}model:{r} {self.model} {d}|{r} {d}cwd:{r} {cwd_short} {d}|{r} {d}tools:{r} {self.tool_count} "
+        d, r = "\033[2m", "\033[0m"
+        parts = [f" {d}model:{r} {self.model}"]
+        if self.git_branch:
+            parts.append(f"{d}branch:{r} {self.git_branch}")
+        parts.append(f"{d}cwd:{r} {cwd_short}")
+        if self.tokens_in or self.tokens_out:
+            tok = f"{self.tokens_in + self.tokens_out:,}"
+            parts.append(f"{d}tokens:{r} {tok}")
+        s = f" {d}|{r} ".join(parts) + " "
         _twrite(f"\033[{self.height};1H\033[2K{s}")
 
     def _draw_input(self, input_rows, base_row):
         for i, (prefix, text) in enumerate(input_rows):
             row = base_row + i
             _twrite(f"\033[{row};1H\033[2K{prefix}{text[:self.width - len(prefix)]}")
-        if self.approval:
-            name, inp = self.approval.get("name", "?"), self.approval.get("input", {})
-            _twrite(f"\033[{base_row};1H\033[2K")
-            _twrite(f"\033[33mAllow {name}({_summarize_args(inp)})? [y/n] \033[0m")
 
     def _draw_transcript(self, t_bottom):
         top = 1
@@ -735,18 +751,27 @@ class TUI:
             self._append(_wrap(f"\033[31m! {ev.get('message','')}\033[0m", self.width))
         elif t == "turn_complete":
             self._stop_spinner()
+            usage = ev.get("usage", {})
+            self.tokens_in += usage.get("input_tokens", 0)
+            self.tokens_out += usage.get("output_tokens", 0)
         elif t == "approval_request":
+            self._stop_spinner()
+            name, inp = ev.get("name", "?"), ev.get("input", {})
+            s = _summarize_args(inp)
+            self._append([f"\033[33m? Allow {name}({s})? [y/n]\033[0m"])
             self.approval = ev; self.redraw = True
 
     def _handle_key(self, ch):
         if self.approval:
             if ch in (b"y", b"Y"):
+                self._append(["\033[33m  approved\033[0m"])
                 self.iq.put({"type": "approval", "approved": True})
             elif ch in (b"n", b"N"):
+                self._append(["\033[33m  denied\033[0m"])
                 self.iq.put({"type": "approval", "approved": False})
             else:
                 return
-            self.approval = None; self.redraw = True; return
+            self.approval = None; self._start_spinner(); return
         if ch in (b"\r", b"\n"):
             text = self.ibuf.strip()
             if text: self.ibuf = ""; self.cpos = 0; self.iq.put(text)
@@ -818,14 +843,30 @@ class TUI:
             r, _, _ = select.select([sys.stdin], [], [], 0.05)
             if not r: break
             b = os.read(_fd, 1); seq += b
+            if b == b"<":
+                continue
             if b and b[0] >= 0x40: break
+        # SGR mouse: <button;col;rowM or <button;col;rowm
+        if seq.startswith(b"<") and (seq.endswith(b"M") or seq.endswith(b"m")):
+            parts = seq[1:-1].split(b";")
+            if len(parts) >= 1:
+                btn = int(parts[0])
+                scroll_lines = 3
+                if btn == 64:
+                    self.scroll = min(self.scroll + scroll_lines,
+                                      max(0, len(self.lines) - (self.height - 5)))
+                    self.redraw = True
+                elif btn == 65:
+                    self.scroll = max(0, self.scroll - scroll_lines)
+                    self.redraw = True
+            return
         if seq == b"D":
             if self.cpos > 0: self.cpos -= 1; self.redraw = True
         elif seq == b"C":
             if self.cpos < len(self.ibuf): self.cpos += 1; self.redraw = True
-        elif seq == b"H" or seq == b"1~":
+        elif seq in (b"H", b"1~"):
             self.cpos = 0; self.redraw = True
-        elif seq == b"F" or seq == b"4~":
+        elif seq in (b"F", b"4~"):
             self.cpos = len(self.ibuf); self.redraw = True
         elif seq == b"1;3D":
             self.cpos = self._word_left(); self.redraw = True
