@@ -10,10 +10,31 @@ Minimal terminal coding agent. **Zero external dependencies** — pure Python 3.
 
 Streams responses from the Anthropic Messages API (or compatible providers like OpenRouter, Minimax, Z.ai, Kimi, Ollama, and LM Studio), executes tools (file ops, shell, MCP), and loops until the task is complete.
 
+## Install
+
+cog is a single Python file with a shebang — you can run it from anywhere by dropping it on your `$PATH`.
+
+**Symlink (tracks upstream changes):**
+
+```sh
+git clone https://github.com/<you>/cog ~/src/cog
+chmod +x ~/src/cog/cog.py
+ln -s ~/src/cog/cog.py ~/.local/bin/cog
+```
+
+**Copy (one-shot, no git):**
+
+```sh
+curl -o ~/.local/bin/cog https://raw.githubusercontent.com/<you>/cog/main/cog.py
+chmod +x ~/.local/bin/cog
+```
+
+Either way, make sure `~/.local/bin` is on your `$PATH`. Then `cog` is available globally.
+
 ## Usage
 
 ```
-python3 cog.py
+cog
 ```
 
 Requires `ANTHROPIC_API_KEY` set in your environment (or a different env var via `api_key_env` in config).
@@ -22,7 +43,7 @@ Flags: `--auto` to skip tool approval prompts, `--cwd PATH` to set working direc
 
 ## Config
 
-Optional. Create `~/.cog/config.json`:
+Optional. Create `~/.config/cog/config.json` (respects `XDG_CONFIG_HOME`):
 
 ```json
 {
@@ -33,7 +54,6 @@ Optional. Create `~/.cog/config.json`:
   "max_tool_calls_per_turn": 10,
   "shell_timeout_seconds": 30,
   "tool_output_max_bytes": 32768,
-  "log_dir": "~/.cog/logs",
   "skills_dirs": [],
   "mcp_servers": [
     {
@@ -45,7 +65,7 @@ Optional. Create `~/.cog/config.json`:
 }
 ```
 
-All fields are optional and fall back to defaults shown above. `${ENV_VAR}` syntax is expanded in string values.
+All fields are optional and fall back to defaults. `${ENV_VAR}` syntax is expanded in string values. Logs go to `~/.config/cog/logs/` and OAuth tokens to `~/.config/cog/tokens/`.
 
 ### Using with Minimax
 
@@ -59,7 +79,7 @@ Minimax provides an [Anthropic-compatible API](https://platform.minimax.io/docs/
 }
 ```
 
-Then set `MINIMAX_API_KEY` in your environment and run `python3 cog.py`.
+Then set `MINIMAX_API_KEY` in your environment and run `cog`.
 
 ### Using with LM Studio
 

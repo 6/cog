@@ -29,6 +29,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+# --- Paths ---
+
+def _cog_dir():
+    """Config + tokens + logs directory. Respects XDG_CONFIG_HOME."""
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(xdg, "cog")
+
 # --- Tools ---
 
 _cwd = "."
@@ -395,7 +402,7 @@ def _mcp_http_post_json(url, data):
     return resp.status, result
 
 def _mcp_token_path(name):
-    d = os.path.expanduser("~/.cog/tokens")
+    d = os.path.join(_cog_dir(), "tokens")
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, f"{name}.json")
 
@@ -1382,7 +1389,7 @@ class Config:
     max_tool_calls_per_turn: int = 10
     shell_timeout_seconds: int = 30
     tool_output_max_bytes: int = 32768
-    log_dir: str = "~/.cog/logs"
+    log_dir: str = field(default_factory=lambda: os.path.join(_cog_dir(), "logs"))
     auto_approve: bool = False
     verbose: bool = False
     token_threshold_warn: int = 100000
@@ -1482,7 +1489,7 @@ def main():
         print(f"Error: requires Python 3.9+, got {sys.version}", file=sys.stderr)
         raise SystemExit(1)
     ap = argparse.ArgumentParser(description="cog - minimal coding agent")
-    ap.add_argument("--config", default="~/.cog/config.json")
+    ap.add_argument("--config", default=os.path.join(_cog_dir(), "config.json"))
     ap.add_argument("--cwd", default=".")
     ap.add_argument("--auto", action="store_true", help="auto-approve all tool calls")
     ap.add_argument("--verbose", action="store_true", help="show full API JSON")
