@@ -1,3 +1,0 @@
-[submodule "vendor/anthropic-sdk-python"]
-	path = vendor/anthropic-sdk-python
-	url = https://github.com/anthropics/anthropic-sdk-python.git

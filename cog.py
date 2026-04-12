@@ -48,8 +48,8 @@ def _resolve(path):
     return resolved
 
 def tool_read_file(args):
-    path = _resolve(args["path"])
     try:
+        path = _resolve(args["path"])
         with open(path, "rb") as f:
             sample = f.read(8192)
         if b"\x00" in sample:
@@ -64,13 +64,15 @@ def tool_read_file(args):
         return f"ERROR: {e}"
 
 def tool_list_dir(args):
-    path = _resolve(args.get("path", "."))
     try:
+        path = _resolve(args.get("path", "."))
         entries = sorted(os.listdir(path))
+    except ValueError as e:
+        return f"ERROR: {e}"
     except FileNotFoundError:
-        return f"ERROR: directory not found: {path}"
+        return f"ERROR: directory not found: {args.get('path', '.')}"
     except PermissionError:
-        return f"ERROR: permission denied: {path}"
+        return f"ERROR: permission denied: {args.get('path', '.')}"
     lines = []
     for name in entries:
         full = os.path.join(path, name)
@@ -79,9 +81,9 @@ def tool_list_dir(args):
     return "\n".join(lines) if lines else "(empty directory)"
 
 def tool_write_file(args):
-    path = _resolve(args["path"])
-    content = args["content"]
     try:
+        path = _resolve(args["path"])
+        content = args["content"]
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -90,12 +92,12 @@ def tool_write_file(args):
         return f"ERROR: {e}"
 
 def tool_str_replace(args):
-    path = _resolve(args["path"])
-    old_str, new_str = args["old_str"], args["new_str"]
     try:
+        path = _resolve(args["path"])
+        old_str, new_str = args["old_str"], args["new_str"]
         content = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
-        return f"ERROR: file not found: {path}"
+        return f"ERROR: file not found: {args.get('path', '?')}"
     except Exception as e:
         return f"ERROR: {e}"
     count = content.count(old_str)
