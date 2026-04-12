@@ -996,7 +996,7 @@ def main():
     cwd = os.path.abspath(args.cwd)
     if args.auto: cfg.auto_approve = True
     if args.verbose: cfg.verbose = True
-    if not cfg.api_key:
+    if not cfg.api_key and cfg.api_base_url == "https://api.anthropic.com":
         print(f"Error: API key not found. Run: export {cfg.api_key_env}=your-key", file=sys.stderr)
         raise SystemExit(1)
 

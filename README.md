@@ -55,7 +55,23 @@ Minimax provides an [Anthropic-compatible API](https://platform.minimax.io/docs/
 
 Then set `MINIMAX_API_KEY` in your environment and run `python3 cog.py`.
 
-The same approach works for any provider that implements the Anthropic Messages API — change `api_base_url`, `model`, and `api_key_env`.
+### Using with LM Studio
+
+[LM Studio](https://lmstudio.ai) provides a local Anthropic-compatible endpoint. Load a model in LM Studio, then configure cog:
+
+```json
+{
+  "api_base_url": "http://localhost:1234",
+  "model": "ibm/granite-4-micro",
+  "api_key_env": "LM_API_TOKEN"
+}
+```
+
+Set `LM_API_TOKEN` in your environment (or omit `api_key_env` if LM Studio auth is disabled). The model name should match what you've loaded in LM Studio.
+
+### Other providers
+
+Any provider that implements the Anthropic Messages API works — change `api_base_url`, `model`, and `api_key_env`.
 
 ## Tools
 
