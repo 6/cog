@@ -1418,6 +1418,11 @@ proc restoreTerminal() {.noconv.} =
   stdout.write("\e[0m")    # reset attrs
   stdout.flushFile()
 
+proc signalExit(sig: cint) {.noconv.} =
+  ## Restore the terminal before exiting on SIGINT/SIGTERM.
+  restoreTerminal()
+  quit(128 + sig.int)
+
 proc inputThread() {.thread.} =
   ## Blocking byte-reader. Uses raw read(2) since getch() toggles termios
   ## per call and we've set raw mode ourselves.
@@ -2107,6 +2112,9 @@ proc main() =
 
   if interactive:
     addExitProc(restoreTerminal)
+    discard signal(SIGINT, signalExit)
+    discard signal(SIGTERM, signalExit)
+    discard signal(SIGHUP, signalExit)
     stdout.write("\e[?25l")
     enterRawMode()
     try:
