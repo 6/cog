@@ -1,5 +1,9 @@
+# Local dev tooling only. cog.py itself has ZERO runtime dependencies —
+# these tools are just for linting, formatting, and type-checking during
+# development. End users never need mise or any of these installed.
 [tools]
-ruff = "0.15.10"
+ruff = "0.15.10"                 # lint + format
+"pipx:basedpyright" = "1.39.0"   # static type checker
 
 [tasks.test]
 description = "Run the unittest suite"
@@ -12,3 +16,7 @@ run = "ruff check cog.py tests"
 [tasks.fmt]
 description = "Format with ruff"
 run = "ruff format cog.py tests"
+
+[tasks.typecheck]
+description = "Type-check with basedpyright"
+run = "basedpyright cog.py"

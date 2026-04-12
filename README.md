@@ -103,10 +103,11 @@ Any provider that implements the Anthropic Messages API works — change `api_ba
 cog itself has no runtime dependencies — `python3 cog.py` is all you need to run it. Dev tasks are wired up through [mise](https://mise.jdx.dev):
 
 ```
-mise install       # installs the pinned ruff version
+mise install       # installs the pinned dev tools (ruff, basedpyright)
 mise run test      # runs the unittest suite under tests/
 mise run lint      # ruff check
 mise run fmt       # ruff format
+mise run typecheck # basedpyright
 ```
 
 For scripts and CI, cog falls back to a line-oriented mode when stdin is not a TTY:
