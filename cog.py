@@ -4,6 +4,7 @@
 import argparse
 import atexit
 import base64
+import fcntl
 import hashlib
 import http.client
 import http.server
@@ -274,8 +275,18 @@ def _mcp_post(server, method, params=None, is_notification=False):
     resp = conn.getresponse()
     if resp.status == 401:
         resp.read(); conn.close()
+        # Try refresh first
+        if not server.get("_refresh_attempted"):
+            server["_refresh_attempted"] = True
+            new_token = _mcp_try_refresh(server)
+            if new_token:
+                server["_oauth_token"] = new_token
+                server["_refresh_attempted"] = False
+                return _mcp_post(server, method, params, is_notification)
+        # Interactive auth if triggered by /mcp auth
         if server.get("_oauth_interactive"):
             server["_oauth_interactive"] = False
+            server["_refresh_attempted"] = False
             token = _mcp_oauth_flow(server)
             server["_oauth_token"] = token
             return _mcp_post(server, method, params, is_notification)
@@ -365,14 +376,20 @@ def _mcp_load_token(name):
     path = _mcp_token_path(name)
     if not os.path.exists(path): return None
     try:
-        with open(path) as f: data = json.load(f)
+        with open(path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            data = json.load(f)
         if data.get("access_token"):
             return data
     except Exception: pass
     return None
 
 def _mcp_save_token(name, data):
-    with open(_mcp_token_path(name), "w") as f: json.dump(data, f)
+    path = _mcp_token_path(name)
+    with open(path, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        json.dump(data, f)
+        f.flush()
 
 def _mcp_oauth_flow(server_cfg):
     """Run OAuth 2.1 PKCE flow for an MCP server. Returns access token string."""
@@ -457,8 +474,33 @@ def _mcp_oauth_flow(server_cfg):
     if status != 200:
         raise MCPError(f"Token exchange failed ({status}): {body}")
     token_data = json.loads(body)
+    token_data["client_id"] = client_id
     _mcp_save_token(name, token_data)
     return token_data["access_token"]
+
+def _mcp_try_refresh(server):
+    """Try to refresh an OAuth token. Returns new access_token or None."""
+    name = server.get("name", "mcp")
+    cached = _mcp_load_token(name)
+    if not cached or not cached.get("refresh_token"):
+        return None
+    base = _mcp_auth_base(server["url"])
+    # Discover token endpoint
+    status, body = _mcp_http_get(f"{base}/.well-known/oauth-authorization-server")
+    token_ep = json.loads(body).get("token_endpoint", f"{base}/token") if status == 200 else f"{base}/token"
+    status, body = _mcp_http_post_form(token_ep, {
+        "grant_type": "refresh_token",
+        "refresh_token": cached["refresh_token"],
+        "client_id": cached.get("client_id", ""),
+    })
+    if status == 200:
+        token_data = json.loads(body)
+        token_data.setdefault("client_id", cached.get("client_id", ""))
+        if not token_data.get("refresh_token"):
+            token_data["refresh_token"] = cached["refresh_token"]
+        _mcp_save_token(name, token_data)
+        return token_data["access_token"]
+    return None
 
 def mcp_initialize(cfg):
     server = dict(cfg, _next_id=0, _session_id=None, _oauth_attempted=False, _oauth_token=None)
@@ -1014,8 +1056,10 @@ class TUI:
   /clear        clear screen
   /tokens       show token usage
   /model [name] show or switch model
-  /mcp [name]   list MCP servers or tools
-  /quit         exit
+  /mcp [name]       list MCP servers or tools
+  /mcp auth <name>  authenticate MCP server
+  /mcp revoke <name> revoke MCP auth token
+  /quit             exit
 
 {d}Shortcuts:{r}
   Opt+Enter     newline
