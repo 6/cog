@@ -189,8 +189,10 @@ def stream_request(api_key, request_body, api_base_url="https://api.anthropic.co
     return resp, conn
 
 def parse_sse_stream(response):
-    event_type = block_type = block_id = block_name = None
-    json_accum = full_text = ""
+    event_type = None
+    block_type = block_id = block_name = None
+    block_index = -1
+    json_accum = text_accum = ""
     usage = {"input_tokens": 0, "output_tokens": 0}
 
     while True:
@@ -210,29 +212,39 @@ def parse_sse_stream(response):
             usage["input_tokens"] = u.get("input_tokens", 0)
         elif event_type == "content_block_start":
             cb = data.get("content_block", {})
+            block_index = data.get("index", block_index + 1)
             block_type = cb.get("type")
+            text_accum = json_accum = ""
             if block_type == "tool_use":
-                block_id, block_name, json_accum = cb.get("id"), cb.get("name"), ""
+                block_id, block_name = cb.get("id"), cb.get("name")
         elif event_type == "content_block_delta":
             delta = data.get("delta", {})
             dtype = delta.get("type")
             if dtype == "text_delta":
                 text = delta.get("text", "")
-                full_text += text
+                text_accum += text
                 yield ("text_delta", text)
             elif dtype == "input_json_delta":
                 json_accum += delta.get("partial_json", "")
+            elif dtype == "thinking_delta":
+                text_accum += delta.get("thinking", "")
         elif event_type == "content_block_stop":
             if block_type == "tool_use":
                 try:
                     tool_input = json.loads(json_accum) if json_accum else {}
                 except json.JSONDecodeError:
                     tool_input = {"_raw": json_accum}
+                yield ("block_done", {"type": "tool_use", "id": block_id,
+                       "name": block_name, "input": tool_input, "index": block_index})
                 yield ("tool_use", {"id": block_id, "name": block_name, "input": tool_input})
             elif block_type == "text":
-                yield ("text_final", full_text)
+                yield ("block_done", {"type": "text", "text": text_accum, "index": block_index})
+                yield ("text_final", text_accum)
+            elif block_type == "thinking":
+                yield ("block_done", {"type": "thinking", "thinking": text_accum, "index": block_index})
+            else:
+                yield ("block_done", {"type": block_type, "index": block_index})
             block_type = block_id = block_name = None
-            json_accum = ""
         elif event_type == "message_delta":
             usage["output_tokens"] = data.get("usage", {}).get("output_tokens", 0)
             yield ("stop", data.get("delta", {}).get("stop_reason", "end_turn"))
@@ -274,7 +286,9 @@ def _mcp_post(server, method, params=None, is_notification=False):
     conn.request("POST", parsed.path or "/", json.dumps(body), headers)
     resp = conn.getresponse()
     if resp.status == 401:
+        www_auth = resp.getheader("WWW-Authenticate", "")
         resp.read(); conn.close()
+        server["_www_authenticate"] = www_auth
         # Try refresh first
         if not server.get("_refresh_attempted"):
             server["_refresh_attempted"] = True
@@ -391,52 +405,90 @@ def _mcp_save_token(name, data):
         json.dump(data, f)
         f.flush()
 
+def _mcp_parse_www_auth(header):
+    """Extract resource_metadata URI from WWW-Authenticate header."""
+    for part in header.split(","):
+        part = part.strip()
+        if "resource_metadata=" in part:
+            val = part.split("resource_metadata=", 1)[1].strip().strip('"')
+            return val
+    return None
+
+def _mcp_discover_auth_server(server_url, www_auth=""):
+    """Discover OAuth authorization server metadata per MCP spec."""
+    base = _mcp_auth_base(server_url)
+    resource = server_url
+    # Try Protected Resource Metadata from WWW-Authenticate
+    res_meta_url = _mcp_parse_www_auth(www_auth) if www_auth else None
+    if not res_meta_url:
+        res_meta_url = f"{base}/.well-known/oauth-protected-resource"
+    status, body = _mcp_http_get(res_meta_url)
+    if status == 200:
+        try:
+            res_meta = json.loads(body)
+            resource = res_meta.get("resource", resource)
+            auth_servers = res_meta.get("authorization_servers", [])
+            if auth_servers:
+                as_url = auth_servers[0]
+                status2, body2 = _mcp_http_get(f"{as_url}/.well-known/oauth-authorization-server")
+                if status2 == 200:
+                    return json.loads(body2), resource
+        except (json.JSONDecodeError, KeyError): pass
+    # Fallback: try AS metadata directly on base URL
+    status, body = _mcp_http_get(f"{base}/.well-known/oauth-authorization-server")
+    if status == 200:
+        try: return json.loads(body), resource
+        except json.JSONDecodeError: pass
+    # Fallback: default endpoints
+    return {"authorization_endpoint": f"{base}/authorize",
+            "token_endpoint": f"{base}/token",
+            "registration_endpoint": f"{base}/register"}, resource
+
 def _mcp_oauth_flow(server_cfg):
     """Run OAuth 2.1 PKCE flow for an MCP server. Returns access token string."""
     name = server_cfg.get("name", "mcp")
-    base = _mcp_auth_base(server_cfg["url"])
+    server_url = server_cfg["url"]
 
     # Check cached token
     cached = _mcp_load_token(name)
     if cached and cached.get("access_token"):
         return cached["access_token"]
 
-    # Discover OAuth metadata
-    meta_url = f"{base}/.well-known/oauth-authorization-server"
-    status, body = _mcp_http_get(meta_url)
-    if status == 200:
-        meta = json.loads(body)
-    else:
-        meta = {}
-    auth_ep = meta.get("authorization_endpoint", f"{base}/authorize")
-    token_ep = meta.get("token_endpoint", f"{base}/token")
-    reg_ep = meta.get("registration_endpoint", f"{base}/register")
+    # Discover auth server (with Protected Resource Metadata support)
+    www_auth = server_cfg.get("_www_authenticate", "")
+    meta, resource = _mcp_discover_auth_server(server_url, www_auth)
+    auth_ep = meta.get("authorization_endpoint")
+    token_ep = meta.get("token_endpoint")
+    reg_ep = meta.get("registration_endpoint")
+
+    # Find free port BEFORE registration so redirect_uri is consistent
+    sock = socket.socket(); sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]; sock.close()
+    redirect_uri = f"http://localhost:{port}/callback"
 
     # Dynamic client registration
-    status, body = _mcp_http_post_json(reg_ep, {
-        "client_name": "cog",
-        "redirect_uris": ["http://localhost/callback"],
-        "grant_types": ["authorization_code"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "none",
-    })
-    if status in (200, 201):
-        reg = json.loads(body)
-        client_id = reg["client_id"]
+    if reg_ep:
+        status, body = _mcp_http_post_json(reg_ep, {
+            "client_name": "cog",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+        if status in (200, 201):
+            reg = json.loads(body)
+            client_id = reg["client_id"]
+        else:
+            raise MCPError(f"Dynamic client registration failed ({status}): {body}")
     else:
-        raise MCPError(f"Dynamic client registration failed ({status}): {body}")
+        raise MCPError("No registration endpoint and no client_id configured")
 
     # PKCE
     verifier = secrets.token_urlsafe(43)
     challenge = base64.urlsafe_b64encode(
         hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
 
-    # Find free port and start callback server
-    sock = socket.socket(); sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]; sock.close()
-    redirect_uri = f"http://localhost:{port}/callback"
     auth_code = [None]
-
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -451,7 +503,7 @@ def _mcp_oauth_flow(server_cfg):
     params = urllib.parse.urlencode({
         "response_type": "code", "client_id": client_id,
         "redirect_uri": redirect_uri, "code_challenge": challenge,
-        "code_challenge_method": "S256",
+        "code_challenge_method": "S256", "resource": resource,
     })
     print(f"Opening browser for {name} authorization...", file=sys.stderr)
     webbrowser.open(f"{auth_ep}?{params}")
@@ -469,12 +521,13 @@ def _mcp_oauth_flow(server_cfg):
     status, body = _mcp_http_post_form(token_ep, {
         "grant_type": "authorization_code", "code": auth_code[0],
         "redirect_uri": redirect_uri, "code_verifier": verifier,
-        "client_id": client_id,
+        "client_id": client_id, "resource": resource,
     })
     if status != 200:
         raise MCPError(f"Token exchange failed ({status}): {body}")
     token_data = json.loads(body)
     token_data["client_id"] = client_id
+    token_data["resource"] = resource
     _mcp_save_token(name, token_data)
     return token_data["access_token"]
 
@@ -484,18 +537,21 @@ def _mcp_try_refresh(server):
     cached = _mcp_load_token(name)
     if not cached or not cached.get("refresh_token"):
         return None
-    base = _mcp_auth_base(server["url"])
-    # Discover token endpoint
-    status, body = _mcp_http_get(f"{base}/.well-known/oauth-authorization-server")
-    token_ep = json.loads(body).get("token_endpoint", f"{base}/token") if status == 200 else f"{base}/token"
+    www_auth = server.get("_www_authenticate", "")
+    meta, resource = _mcp_discover_auth_server(server["url"], www_auth)
+    token_ep = meta.get("token_endpoint")
+    if not token_ep: return None
+    resource = cached.get("resource", resource)
     status, body = _mcp_http_post_form(token_ep, {
         "grant_type": "refresh_token",
         "refresh_token": cached["refresh_token"],
         "client_id": cached.get("client_id", ""),
+        "resource": resource,
     })
     if status == 200:
         token_data = json.loads(body)
         token_data.setdefault("client_id", cached.get("client_id", ""))
+        token_data.setdefault("resource", resource)
         if not token_data.get("refresh_token"):
             token_data["refresh_token"] = cached["refresh_token"]
         _mcp_save_token(name, token_data)
@@ -605,18 +661,23 @@ class Agent:
                     self.emit({"type": "error", "message": f"Network error: {e}"}); return
             if resp is None:
                 return
-            content_blocks, tool_uses, usage, full_text = [], [], {}, ""
+            blocks, tool_uses, usage = [], [], {}
             try:
                 for kind, payload in parse_sse_stream(resp):
                     if kind == "text_delta":
                         self.emit({"type": "assistant_text_delta", "text": payload})
                     elif kind == "text_final":
-                        full_text = payload
                         self.emit({"type": "assistant_text_final", "text": payload})
                     elif kind == "tool_use":
                         tool_uses.append(payload)
                         self.emit({"type": "tool_call", "tool_id": payload["id"],
                                    "name": payload["name"], "input": payload["input"]})
+                    elif kind == "block_done":
+                        block = {k: v for k, v in payload.items() if k != "index"}
+                        if block.get("type") == "text":
+                            block["text"] = block.get("text", "").strip()
+                        if block.get("text", True):  # skip empty text blocks
+                            blocks.append(block)
                     elif kind == "usage":
                         usage = payload
             except Exception as e:
@@ -624,11 +685,7 @@ class Agent:
             finally:
                 try: conn.close()
                 except Exception: pass
-            if full_text:
-                content_blocks.append({"type": "text", "text": full_text.strip()})
-            for tu in tool_uses:
-                content_blocks.append({"type": "tool_use", "id": tu["id"],
-                                       "name": tu["name"], "input": tu["input"]})
+            content_blocks = blocks
             if content_blocks:
                 self.messages.append({"role": "assistant", "content": content_blocks})
             if self.verbose:
