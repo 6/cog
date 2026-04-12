@@ -476,6 +476,10 @@ class Agent:
             if msg is None:
                 break
             if isinstance(msg, dict):
+                if msg.get("type") == "switch_model":
+                    self.model = msg["model"]
+                    self.api_key = msg.get("api_key", "")
+                    self.api_base_url = msg["api_base_url"]
                 continue
             try:
                 self.run_turn(msg)
@@ -531,9 +535,11 @@ def _out_inline(s):
 
 class TUI:
     def __init__(self, event_queue, input_queue, model="", cwd="", tool_count=0,
-                 token_threshold_warn=100000, token_threshold_danger=200000):
+                 token_threshold_warn=100000, token_threshold_danger=200000, models=None):
         self.eq, self.iq = event_queue, input_queue
         self.model, self.cwd, self.tool_count = model, cwd, tool_count
+        self.models = models or {}
+        self._active_model_key = ""
         self.token_threshold_warn, self.token_threshold_danger = token_threshold_warn, token_threshold_danger
         self.git_branch = _git_branch(cwd)
         self.tokens_in = self.tokens_out = 0
@@ -825,7 +831,7 @@ class TUI:
   /help         show this message
   /clear        clear screen
   /tokens       show token usage
-  /model        show current model
+  /model [name] show or switch model
   /quit         exit
 
 {d}Shortcuts:{r}
@@ -842,7 +848,26 @@ class TUI:
             tok = self.tokens_in + self.tokens_out
             _out(f"  {d}input:{r} {self.tokens_in:,}  {d}output:{r} {self.tokens_out:,}  {d}total:{r} {tok:,}")
         elif c == "/model":
-            _out(f"  {self.model}")
+            parts = cmd.split(maxsplit=1)
+            if len(parts) == 1:
+                _out(f"  {d}active:{r} {self.model}")
+                if self.models:
+                    for name, m in self.models.items():
+                        marker = " *" if name == self._active_model_key else ""
+                        _out(f"  {d}{name}:{r} {m.get('model', name)}{marker}")
+            else:
+                name = parts[1].strip()
+                if name in self.models:
+                    m = self.models[name]
+                    self.model = m.get("model", name)
+                    api_key = os.environ.get(m.get("api_key_env", ""), "")
+                    api_base = m.get("api_base_url", "https://api.anthropic.com")
+                    self._active_model_key = name
+                    self.iq.put({"type": "switch_model", "model": self.model,
+                                 "api_key": api_key, "api_base_url": api_base})
+                    _out(f"  {d}switched to{r} {self.model}")
+                else:
+                    _out(f"  {d}unknown model: {name} (available: {', '.join(self.models.keys())}){r}")
         elif c in ("/quit", "/exit"):
             self.running = False; return
         else:
@@ -904,6 +929,7 @@ class Config:
     model: str = "claude-sonnet-4-20250514"
     api_key_env: str = "ANTHROPIC_API_KEY"
     api_base_url: str = "https://api.anthropic.com"
+    models: dict = field(default_factory=dict)
     skills_dirs: list = field(default_factory=list)
     mcp_servers: list = field(default_factory=list)
     max_tool_calls_per_turn: int = 10
@@ -953,8 +979,17 @@ def _load_config(path):
     cfg = Config(**{k: v for k, v in raw.items() if k in known})
     cfg.log_dir = os.path.expanduser(cfg.log_dir)
     cfg.skills_dirs = [os.path.expanduser(p) for p in cfg.skills_dirs]
-    cfg.api_key = os.environ.get(cfg.api_key_env, "")
+    _resolve_model(cfg)
     return cfg
+
+def _resolve_model(cfg):
+    """If cfg.model is a key in cfg.models, apply that model's settings."""
+    if cfg.models and cfg.model in cfg.models:
+        m = cfg.models[cfg.model]
+        cfg.api_base_url = m.get("api_base_url", cfg.api_base_url)
+        cfg.api_key_env = m.get("api_key_env", cfg.api_key_env)
+        cfg.model = m.get("model", cfg.model)
+    cfg.api_key = os.environ.get(cfg.api_key_env, "")
 
 def _load_skills(dirs):
     skills = []
@@ -1020,7 +1055,8 @@ def main():
     agent = Agent(cfg, tool_reg, eq, iq)
     threading.Thread(target=agent.worker_loop, daemon=True).start()
     TUI(eq, iq, model=cfg.model, cwd=cwd, tool_count=len(tool_reg),
-        token_threshold_warn=cfg.token_threshold_warn, token_threshold_danger=cfg.token_threshold_danger).run()
+        token_threshold_warn=cfg.token_threshold_warn, token_threshold_danger=cfg.token_threshold_danger,
+        models=cfg.models).run()
     iq.put(None)
 
 if __name__ == "__main__":
