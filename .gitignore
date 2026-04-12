@@ -215,3 +215,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Nim
+nimcache/
+nimblecache/
+*.exe
+# compiled cog binary at repo root
+/cog
+
