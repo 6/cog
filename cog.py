@@ -1048,125 +1048,132 @@ class TUI:
 
     def _handle_slash(self, cmd):
         d, r = "\033[2m", "\033[0m"
-        c = cmd.split()[0].lower()
+        parts = cmd.split()
+        c = parts[0].lower()
         if c == "/help":
             _out(f"""
 {d}Commands:{r}
-  /help         show this message
-  /clear        clear screen
-  /tokens       show token usage
-  /model [name] show or switch model
-  /mcp [name]       list MCP servers or tools
-  /mcp auth <name>  authenticate MCP server
+  /help              show this message
+  /clear             clear screen
+  /tokens            show token usage
+  /model [name]      show or switch model
+  /mcp [name]        list MCP servers or tools
+  /mcp auth <name>   authenticate MCP server
   /mcp revoke <name> revoke MCP auth token
-  /quit             exit
+  /quit              exit
 
 {d}Shortcuts:{r}
-  Opt+Enter     newline
-  Opt+Left/Right  word jump
-  Opt+Delete    delete word
-  Cmd+Delete    delete line
-  Ctrl+A/E      home / end
-  Ctrl+C        exit
+  Opt+Enter          newline
+  Opt+Left/Right     word jump
+  Opt+Delete         delete word
+  Cmd+Delete         delete line
+  Ctrl+A/E           home / end
+  Ctrl+C             exit
 """)
         elif c == "/clear":
             sys.stdout.write("\033[2J\033[H"); sys.stdout.flush()
         elif c == "/tokens":
             tok = self.tokens_in + self.tokens_out
             _out(f"  {d}input:{r} {self.tokens_in:,}  {d}output:{r} {self.tokens_out:,}  {d}total:{r} {tok:,}")
-        elif c == "/model":
-            parts = cmd.split(maxsplit=1)
-            if len(parts) == 1:
-                _out(f"  {d}active:{r} {self.model}")
-                if self.models:
-                    for name, m in self.models.items():
-                        marker = " *" if name == self._active_model_key else ""
-                        _out(f"  {d}{name}:{r} {m.get('model', name)}{marker}")
-            else:
-                name = parts[1].strip()
-                if name in self.models:
-                    m = self.models[name]
-                    self.model = m.get("model", name)
-                    api_key = os.environ.get(m.get("api_key_env", ""), "")
-                    api_base = m.get("api_base_url", "https://api.anthropic.com")
-                    self._active_model_key = name
-                    self.iq.put({"type": "switch_model", "model": self.model,
-                                 "api_key": api_key, "api_base_url": api_base})
-                    _out(f"  {d}switched to{r} {self.model}")
-                else:
-                    _out(f"  {d}unknown model: {name} (available: {', '.join(self.models.keys())}){r}")
-        elif c == "/mcp":
-            parts = cmd.split(maxsplit=2)
-            if not self.mcp_servers:
-                _out(f"  {d}no MCP servers configured{r}"); return
-            if len(parts) == 1:
-                for s in self.mcp_servers:
-                    sname = s.get("name", "?")
-                    pending = any(p.get("name") == sname for p in getattr(self, "_pending_auth", []))
-                    if pending:
-                        _out(f"  {d}{sname}{r} {s.get('url', '')} \033[33m(auth required: /mcp auth {sname})\033[0m")
-                    else:
-                        n = sum(1 for _, e in self._mcp_tools.items() if e[1].get("name") == sname)
-                        _out(f"  {d}{sname}{r} {s.get('url', '')} {d}({n} tools){r}")
-            elif parts[1] == "revoke" and len(parts) == 3:
-                name = parts[2].strip()
-                path = _mcp_token_path(name)
-                if os.path.exists(path):
-                    os.remove(path)
-                    # Remove tools from active session
-                    to_remove = [t for t, e in self._mcp_tools.items() if e[1].get("name") == name]
-                    for t in to_remove:
-                        self._mcp_tools.pop(t, None)
-                        self._tool_reg.pop(t, None)
-                        self._agent.tools.pop(t, None)
-                    self.tool_count = len(self._tool_reg)
-                    # Add back to pending auth
-                    srv = next((s for s in self.mcp_servers if s.get("name") == name), None)
-                    if srv and srv not in self._pending_auth:
-                        self._pending_auth.append(srv)
-                    _out(f"  {d}token revoked for {name}, {len(to_remove)} tools removed{r}")
-                else:
-                    _out(f"  {d}no token found for {name}{r}")
-            elif parts[1] == "auth" and len(parts) == 3:
-                name = parts[2].strip()
-                pending = [p for p in getattr(self, "_pending_auth", []) if p.get("name") == name]
-                if not pending:
-                    _out(f"  {d}{name} does not need auth{r}"); return
-                try:
-                    pcfg = pending[0]
-                    pcfg["_oauth_interactive"] = True
-                    server = mcp_initialize(pcfg)
-                    server["name"] = name
-                    result = _mcp_post(server, "tools/list", {})
-                    mcp_tools = (result or {}).get("result", {}).get("tools", []) if result and "error" not in result else []
-                    multi = len(self.mcp_servers) > 1
-                    for t in mcp_tools:
-                        tname = f"{name}__{t['name']}" if multi else t["name"]
-                        entry = ("mcp", server,
-                            {"name": tname, "description": t.get("description", ""),
-                             "input_schema": t.get("inputSchema", {"type": "object", "properties": {}})},
-                            t["name"])
-                        self._mcp_tools[tname] = entry
-                        self._tool_reg[tname] = entry
-                        self._agent.tools[tname] = entry
-                    self._pending_auth = [p for p in self._pending_auth if p.get("name") != name]
-                    self.tool_count = len(self._tool_reg)
-                    _out(f"  {d}authenticated. {len(mcp_tools)} tools loaded from {name}{r}")
-                except Exception as e:
-                    _out(f"  \033[31mauth failed: {e}\033[0m")
-            else:
-                name = parts[1].strip()
-                found = False
-                for tname, entry in self._mcp_tools.items():
-                    if entry[1].get("name") == name or len(self.mcp_servers) == 1:
-                        _out(f"  {d}{tname}:{r} {entry[2].get('description', '')[:80]}")
-                        found = True
-                if not found:
-                    _out(f"  {d}no tools found for '{name}'{r}")
+        elif c == "/model": self._cmd_model(parts[1:])
+        elif c == "/mcp": self._cmd_mcp(parts[1:])
         elif c in ("/quit", "/exit"):
-            self.running = False; return
+            self.running = False
         else:
             _out(f"  {d}unknown command: {c} (try /help){r}")
+
+    def _cmd_model(self, args):
+        d, r = "\033[2m", "\033[0m"
+        if not args:
+            _out(f"  {d}active:{r} {self.model}")
+            for name, m in self.models.items():
+                marker = " *" if name == self._active_model_key else ""
+                _out(f"  {d}{name}:{r} {m.get('model', name)}{marker}")
+            return
+        name = args[0]
+        if name not in self.models:
+            _out(f"  {d}unknown model: {name} (available: {', '.join(self.models.keys())}){r}")
+            return
+        m = self.models[name]
+        self.model = m.get("model", name)
+        self._active_model_key = name
+        self.iq.put({"type": "switch_model", "model": self.model,
+                     "api_key": os.environ.get(m.get("api_key_env", ""), ""),
+                     "api_base_url": m.get("api_base_url", "https://api.anthropic.com")})
+        _out(f"  {d}switched to{r} {self.model}")
+
+    def _cmd_mcp(self, args):
+        d, r = "\033[2m", "\033[0m"
+        if not self.mcp_servers:
+            _out(f"  {d}no MCP servers configured{r}"); return
+        if not args:
+            for s in self.mcp_servers:
+                sname = s.get("name", "?")
+                if any(p.get("name") == sname for p in self._pending_auth):
+                    _out(f"  {d}{sname}{r} {s.get('url', '')} \033[33m(auth required: /mcp auth {sname})\033[0m")
+                else:
+                    n = sum(1 for _, e in self._mcp_tools.items() if e[1].get("name") == sname)
+                    _out(f"  {d}{sname}{r} {s.get('url', '')} {d}({n} tools){r}")
+            return
+        sub = args[0]
+        if sub == "auth" and len(args) > 1: self._cmd_mcp_auth(args[1])
+        elif sub == "revoke" and len(args) > 1: self._cmd_mcp_revoke(args[1])
+        else: self._cmd_mcp_tools(sub)
+
+    def _cmd_mcp_auth(self, name):
+        d, r = "\033[2m", "\033[0m"
+        pending = [p for p in self._pending_auth if p.get("name") == name]
+        if not pending:
+            _out(f"  {d}{name} does not need auth{r}"); return
+        try:
+            pcfg = pending[0]
+            pcfg["_oauth_interactive"] = True
+            server = mcp_initialize(pcfg)
+            server["name"] = name
+            result = _mcp_post(server, "tools/list", {})
+            mcp_tools = (result or {}).get("result", {}).get("tools", []) if result and "error" not in result else []
+            multi = len(self.mcp_servers) > 1
+            for t in mcp_tools:
+                tname = f"{name}__{t['name']}" if multi else t["name"]
+                entry = ("mcp", server,
+                    {"name": tname, "description": t.get("description", ""),
+                     "input_schema": t.get("inputSchema", {"type": "object", "properties": {}})},
+                    t["name"])
+                self._mcp_tools[tname] = entry
+                self._tool_reg[tname] = entry
+                self._agent.tools[tname] = entry
+            self._pending_auth = [p for p in self._pending_auth if p.get("name") != name]
+            self.tool_count = len(self._tool_reg)
+            _out(f"  {d}authenticated. {len(mcp_tools)} tools loaded from {name}{r}")
+        except Exception as e:
+            _out(f"  \033[31mauth failed: {e}\033[0m")
+
+    def _cmd_mcp_revoke(self, name):
+        d, r = "\033[2m", "\033[0m"
+        path = _mcp_token_path(name)
+        if not os.path.exists(path):
+            _out(f"  {d}no token found for {name}{r}"); return
+        os.remove(path)
+        removed = [t for t, e in self._mcp_tools.items() if e[1].get("name") == name]
+        for t in removed:
+            self._mcp_tools.pop(t, None)
+            self._tool_reg.pop(t, None)
+            self._agent.tools.pop(t, None)
+        self.tool_count = len(self._tool_reg)
+        srv = next((s for s in self.mcp_servers if s.get("name") == name), None)
+        if srv and srv not in self._pending_auth:
+            self._pending_auth.append(srv)
+        _out(f"  {d}revoked {name}, {len(removed)} tools removed{r}")
+
+    def _cmd_mcp_tools(self, name):
+        d, r = "\033[2m", "\033[0m"
+        found = False
+        for tname, entry in self._mcp_tools.items():
+            if entry[1].get("name") == name or len(self.mcp_servers) == 1:
+                _out(f"  {d}{tname}:{r} {entry[2].get('description', '')[:80]}")
+                found = True
+        if not found:
+            _out(f"  {d}no tools found for '{name}'{r}")
 
     def _esc(self):
         r, _, _ = select.select([sys.stdin], [], [], 0.05)
