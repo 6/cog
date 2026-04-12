@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """cog - minimal coding agent. Stdlib-only, Python 3.9+."""
 
+from __future__ import annotations
+
 import argparse
 import atexit
 import base64
@@ -51,8 +53,9 @@ def _resolve(path):
 
 
 def tool_read_file(args):
+    path = args.get("path", "?")
     try:
-        path = _resolve(args["path"])
+        path = _resolve(path)
         with open(path, "rb") as f:
             sample = f.read(8192)
         if b"\x00" in sample:
@@ -250,6 +253,8 @@ def build_request(model, system, messages, tools, max_tokens=4096):
 def stream_request(api_key, request_body, api_base_url="https://api.anthropic.com"):
     parsed = urllib.parse.urlparse(api_base_url)
     host = parsed.hostname
+    if not host:
+        raise ValueError(f"invalid api_base_url (no host): {api_base_url}")
     port = parsed.port
     base_path = (parsed.path or "").rstrip("/")
     if parsed.scheme == "https":
@@ -646,7 +651,7 @@ def _mcp_oauth_flow(server_cfg):
         .decode()
     )
 
-    auth_code = [None]
+    auth_code: list[str | None] = [None]
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -660,7 +665,7 @@ def _mcp_oauth_flow(server_cfg):
                 b"<p>You can close this tab.</p></body></html>"
             )
 
-        def log_message(self, *a):
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
     params = urllib.parse.urlencode(
@@ -879,7 +884,7 @@ class Agent:
                         continue
                     self.emit({"type": "error", "message": f"Network error: {e}"})
                     return
-            if resp is None:
+            if resp is None or conn is None:
                 return
             blocks, tool_uses, usage = [], [], {}
             try:
@@ -1047,7 +1052,7 @@ class Agent:
 # --- TUI ---
 
 _original_termios = None
-_fd = None
+_fd: int = 0  # stdin's well-known fd; overwritten by _set_cbreak()
 
 
 def _set_cbreak():
@@ -1125,12 +1130,20 @@ class TUI:
         token_threshold_danger=200000,
         models=None,
         mcp_servers=None,
+        tool_reg=None,
+        agent=None,
+        pending_auth=None,
     ):
         self.eq, self.iq = event_queue, input_queue
         self.model, self.cwd, self.tool_count = model, cwd, tool_count
         self.models = models or {}
         self.mcp_servers = mcp_servers or []
-        self._mcp_tools = {}
+        self._tool_reg = tool_reg if tool_reg is not None else {}
+        self._agent = agent
+        self._pending_auth = pending_auth if pending_auth is not None else []
+        self._mcp_tools = {
+            k: v for k, v in self._tool_reg.items() if v[0] == "mcp"
+        }
         self._active_model_key = ""
         self.token_threshold_warn, self.token_threshold_danger = (
             token_threshold_warn,
@@ -1150,6 +1163,7 @@ class TUI:
         self._SPIN = "⠷⠯⠻⠽⠾"
         self._spin_line_active = False
         self._streaming_started = False
+        self._drawn_rows = 1
 
     def _prompt_prefix(self):
         cwd_short = os.path.basename(self.cwd) or self.cwd
@@ -1238,7 +1252,7 @@ class TUI:
         self._drawn_rows = len(rows)
 
     def _clear_input(self):
-        n = getattr(self, "_drawn_rows", 1)
+        n = self._drawn_rows
         sys.stdout.write("\r\033[2K")
         for _ in range(n - 1):
             sys.stdout.write("\033[1B\033[2K")
@@ -1579,7 +1593,8 @@ class TUI:
                 )
                 self._mcp_tools[tname] = entry
                 self._tool_reg[tname] = entry
-                self._agent.tools[tname] = entry
+                if self._agent is not None:
+                    self._agent.tools[tname] = entry
             self._pending_auth = [
                 p for p in self._pending_auth if p.get("name") != name
             ]
@@ -1599,7 +1614,8 @@ class TUI:
         for t in removed:
             self._mcp_tools.pop(t, None)
             self._tool_reg.pop(t, None)
-            self._agent.tools.pop(t, None)
+            if self._agent is not None:
+                self._agent.tools.pop(t, None)
         self.tool_count = len(self._tool_reg)
         srv = next((s for s in self.mcp_servers if s.get("name") == name), None)
         if srv and srv not in self._pending_auth:
@@ -1666,7 +1682,7 @@ class TUI:
         _set_cbreak()
         atexit.register(_restore_term)
         self._banner()
-        pending = getattr(self, "_pending_auth", [])
+        pending = self._pending_auth
         if pending:
             n = len(pending)
             names = ", ".join(p.get("name", "?") for p in pending)
@@ -1766,9 +1782,9 @@ class Config:
     model: str = "claude-sonnet-4-20250514"
     api_key_env: str = "ANTHROPIC_API_KEY"
     api_base_url: str = "https://api.anthropic.com"
-    models: dict = field(default_factory=dict)
-    skills_dirs: list = field(default_factory=list)
-    mcp_servers: list = field(default_factory=list)
+    models: dict[str, dict] = field(default_factory=dict)
+    skills_dirs: list[str] = field(default_factory=list)
+    mcp_servers: list[dict] = field(default_factory=list)
     max_tool_calls_per_turn: int = 10
     shell_timeout_seconds: int = 30
     tool_output_max_bytes: int = 32768
@@ -1946,11 +1962,10 @@ def main():
         token_threshold_danger=cfg.token_threshold_danger,
         models=cfg.models,
         mcp_servers=cfg.mcp_servers,
+        tool_reg=tool_reg,
+        agent=agent,
+        pending_auth=pending_auth,
     )
-    tui._mcp_tools = {k: v for k, v in tool_reg.items() if v[0] == "mcp"}
-    tui._pending_auth = pending_auth
-    tui._tool_reg = tool_reg
-    tui._agent = agent
     tui.run()
     iq.put(None)
 
