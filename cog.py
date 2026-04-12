@@ -965,7 +965,18 @@ def _expand_env(v):
     if isinstance(v, list): return [_expand_env(i) for i in v]
     return v
 
-def _load_config(path):
+def _find_local_config(cwd):
+    d = os.path.abspath(cwd)
+    while True:
+        candidate = os.path.join(d, ".cog", "config.json")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d: break
+        d = parent
+    return None
+
+def _load_config(path, cwd="."):
     path = os.path.expanduser(path)
     raw = {}
     if os.path.exists(path):
@@ -974,6 +985,9 @@ def _load_config(path):
             print(f"Warning: {path} is accessible by others (mode {oct(mode)}). "
                   f"Run: chmod 600 {path}", file=sys.stderr)
         with open(path) as f: raw = json.load(f)
+    local = _find_local_config(cwd)
+    if local:
+        with open(local) as f: raw.update(json.load(f))
     raw = _expand_env(raw)
     known = {f.name for f in Config.__dataclass_fields__.values()}
     cfg = Config(**{k: v for k, v in raw.items() if k in known})
@@ -1027,8 +1041,8 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="show full API JSON")
     args = ap.parse_args()
 
-    cfg = _load_config(args.config)
     cwd = os.path.abspath(args.cwd)
+    cfg = _load_config(args.config, cwd)
     if args.auto: cfg.auto_approve = True
     if args.verbose: cfg.verbose = True
     if not cfg.api_key and cfg.api_base_url == "https://api.anthropic.com":
