@@ -3,18 +3,24 @@
 
 import argparse
 import atexit
+import base64
+import hashlib
 import http.client
+import http.server
 import json
 import os
 import queue
 import re
+import secrets
 import select
+import socket
 import ssl
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -254,11 +260,19 @@ def _mcp_post(server, method, params=None, is_notification=False):
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     if server.get("_session_id"):
         headers["Mcp-Session-Id"] = server["_session_id"]
+    if server.get("_oauth_token"):
+        headers["Authorization"] = f"Bearer {server['_oauth_token']}"
     for k, v in server.get("headers", {}).items():
         headers[k] = v
     conn = _mcp_connect(parsed)
     conn.request("POST", parsed.path or "/", json.dumps(body), headers)
     resp = conn.getresponse()
+    if resp.status == 401 and not server.get("_oauth_attempted"):
+        resp.read(); conn.close()
+        server["_oauth_attempted"] = True
+        token = _mcp_oauth_flow(server)
+        server["_oauth_token"] = token
+        return _mcp_post(server, method, params, is_notification)
     if is_notification:
         resp.read(); conn.close(); return None
     ct = resp.getheader("Content-Type", "")
@@ -286,8 +300,165 @@ def _mcp_read_sse(resp, request_id):
     resp.read()
     return None
 
+# --- MCP OAuth 2.1 ---
+
+def _mcp_auth_base(url):
+    """Strip path from MCP URL to get auth base URL."""
+    p = urllib.parse.urlparse(url)
+    return f"{p.scheme}://{p.hostname}" + (f":{p.port}" if p.port else "")
+
+def _mcp_http_get(url):
+    p = urllib.parse.urlparse(url)
+    if p.scheme == "https":
+        conn = http.client.HTTPSConnection(p.hostname, p.port or 443, timeout=10,
+                                           context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(p.hostname, p.port or 80, timeout=10)
+    conn.request("GET", p.path or "/", headers={"MCP-Protocol-Version": "2025-03-26"})
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    return resp.status, body
+
+def _mcp_http_post_form(url, data):
+    p = urllib.parse.urlparse(url)
+    if p.scheme == "https":
+        conn = http.client.HTTPSConnection(p.hostname, p.port or 443, timeout=10,
+                                           context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(p.hostname, p.port or 80, timeout=10)
+    body = urllib.parse.urlencode(data)
+    conn.request("POST", p.path or "/", body,
+                 {"Content-Type": "application/x-www-form-urlencoded"})
+    resp = conn.getresponse()
+    result = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    return resp.status, result
+
+def _mcp_http_post_json(url, data):
+    p = urllib.parse.urlparse(url)
+    if p.scheme == "https":
+        conn = http.client.HTTPSConnection(p.hostname, p.port or 443, timeout=10,
+                                           context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(p.hostname, p.port or 80, timeout=10)
+    conn.request("POST", p.path or "/", json.dumps(data),
+                 {"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    result = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    return resp.status, result
+
+def _mcp_token_path(name):
+    d = os.path.expanduser("~/.cog/tokens")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{name}.json")
+
+def _mcp_load_token(name):
+    path = _mcp_token_path(name)
+    if not os.path.exists(path): return None
+    try:
+        with open(path) as f: data = json.load(f)
+        if data.get("access_token"):
+            return data
+    except Exception: pass
+    return None
+
+def _mcp_save_token(name, data):
+    with open(_mcp_token_path(name), "w") as f: json.dump(data, f)
+
+def _mcp_oauth_flow(server_cfg):
+    """Run OAuth 2.1 PKCE flow for an MCP server. Returns access token string."""
+    name = server_cfg.get("name", "mcp")
+    base = _mcp_auth_base(server_cfg["url"])
+
+    # Check cached token
+    cached = _mcp_load_token(name)
+    if cached and cached.get("access_token"):
+        return cached["access_token"]
+
+    # Discover OAuth metadata
+    meta_url = f"{base}/.well-known/oauth-authorization-server"
+    status, body = _mcp_http_get(meta_url)
+    if status == 200:
+        meta = json.loads(body)
+    else:
+        meta = {}
+    auth_ep = meta.get("authorization_endpoint", f"{base}/authorize")
+    token_ep = meta.get("token_endpoint", f"{base}/token")
+    reg_ep = meta.get("registration_endpoint", f"{base}/register")
+
+    # Dynamic client registration
+    status, body = _mcp_http_post_json(reg_ep, {
+        "client_name": "cog",
+        "redirect_uris": ["http://localhost/callback"],
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    })
+    if status in (200, 201):
+        reg = json.loads(body)
+        client_id = reg["client_id"]
+    else:
+        raise MCPError(f"Dynamic client registration failed ({status}): {body}")
+
+    # PKCE
+    verifier = secrets.token_urlsafe(43)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+    # Find free port and start callback server
+    sock = socket.socket(); sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]; sock.close()
+    redirect_uri = f"http://localhost:{port}/callback"
+    auth_code = [None]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            auth_code[0] = qs.get("code", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body><h2>Authorization complete.</h2>"
+                             b"<p>You can close this tab.</p></body></html>")
+        def log_message(self, *a): pass
+
+    params = urllib.parse.urlencode({
+        "response_type": "code", "client_id": client_id,
+        "redirect_uri": redirect_uri, "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    })
+    print(f"Opening browser for {name} authorization...", file=sys.stderr)
+    webbrowser.open(f"{auth_ep}?{params}")
+
+    srv = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    srv.timeout = 120
+    while auth_code[0] is None:
+        srv.handle_request()
+    srv.server_close()
+
+    if not auth_code[0]:
+        raise MCPError("OAuth callback did not receive authorization code")
+
+    # Exchange code for token
+    status, body = _mcp_http_post_form(token_ep, {
+        "grant_type": "authorization_code", "code": auth_code[0],
+        "redirect_uri": redirect_uri, "code_verifier": verifier,
+        "client_id": client_id,
+    })
+    if status != 200:
+        raise MCPError(f"Token exchange failed ({status}): {body}")
+    token_data = json.loads(body)
+    _mcp_save_token(name, token_data)
+    return token_data["access_token"]
+
 def mcp_initialize(cfg):
-    server = dict(cfg, _next_id=0, _session_id=None)
+    server = dict(cfg, _next_id=0, _session_id=None, _oauth_attempted=False, _oauth_token=None)
+    # Load cached OAuth token if available
+    cached = _mcp_load_token(cfg.get("name", "mcp"))
+    if cached and cached.get("access_token"):
+        server["_oauth_token"] = cached["access_token"]
     result = _mcp_post(server, "initialize", {
         "protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
         "clientInfo": {"name": "cog", "version": "0.1.0"}})
