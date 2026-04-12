@@ -91,3 +91,25 @@ Any provider that implements the Anthropic Messages API works — change `api_ba
 | Cmd+Delete | Delete line |
 | Ctrl+A / Ctrl+E | Home / End |
 | Ctrl+C | Exit |
+
+## Local development
+
+cog is a single stdlib-only file — no install step, no dependencies to manage.
+
+### Running tests
+
+```
+python3 -m unittest discover tests
+```
+
+The suite lives in `tests/` and uses `unittest` (stdlib). It covers the path boundary guard, config loading, skill parsing, the SSE stream decoder, the file tools, and a few small string parsers. Runs in under a second.
+
+### Piped / non-interactive mode
+
+For scripts and CI, cog falls back to a line-oriented mode when stdin is not a TTY:
+
+```
+echo "list files in docs" | python3 cog.py --auto
+```
+
+In this mode slash commands are ignored, approval prompts are answered from the next stdin line, and output is plain text with no ANSI.
