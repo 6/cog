@@ -41,7 +41,9 @@ def _resolve(path):
     if not p.is_absolute():
         p = Path(_cwd) / p
     resolved = str(p.resolve())
-    if not resolved.startswith(_cwd):
+    # Boundary check must not allow a co-named sibling like `/cwd2/x` to pass
+    # when _cwd is `/cwd`. Accept the cwd itself or any path under `cwd + sep`.
+    if resolved != _cwd and not resolved.startswith(_cwd + os.sep):
         raise ValueError(f"path escapes working directory: {path}")
     return resolved
 
@@ -679,7 +681,9 @@ class Agent:
                         block = {k: v for k, v in payload.items() if k != "index"}
                         if block.get("type") == "text":
                             block["text"] = block.get("text", "").strip()
-                        if block.get("text", True):  # skip empty text blocks
+                        is_empty_text = (block.get("type") == "text"
+                                         and not block.get("text", ""))
+                        if not is_empty_text:
                             blocks.append(block)
                     elif kind == "usage":
                         usage = payload
@@ -1265,6 +1269,9 @@ class TUI:
             elif seq == b"1;3C": self.cpos = self._word_right()
 
     def run(self):
+        if not sys.stdin.isatty():
+            self._run_headless()
+            return
         _set_cbreak(); atexit.register(_restore_term)
         self._banner()
         pending = getattr(self, "_pending_auth", [])
@@ -1289,6 +1296,62 @@ class TUI:
         finally:
             _restore_term()
             _out("\n\033[2mbye\033[0m")
+
+    def _run_headless(self):
+        """Line-oriented fallback for piped/scripted stdin. No raw mode, no
+        redraw — just read a line, send it, print events until the turn
+        completes. Approval prompts are answered from the next stdin line."""
+        print(f"cog — {self.model} — {self.tool_count} tools")
+        print("> ", end="", flush=True)
+        while self.running:
+            try:
+                line = sys.stdin.readline()
+            except KeyboardInterrupt:
+                break
+            if not line:  # EOF
+                break
+            line = line.rstrip("\n")
+            if not line:
+                print("> ", end="", flush=True); continue
+            if line in ("/quit", "/exit"):
+                break
+            if line.startswith("/"):
+                # Slash commands other than quit are ignored in headless mode;
+                # they exist for the interactive TUI.
+                print(f"  (slash commands are ignored in non-interactive mode)")
+                print("> ", end="", flush=True); continue
+            self.iq.put(line)
+            while True:
+                ev = self.eq.get()
+                t = ev.get("type")
+                if t == "assistant_text_delta":
+                    print(ev.get("text", ""), end="", flush=True)
+                elif t == "assistant_text_final":
+                    print()
+                elif t == "tool_call":
+                    print(f"> {ev.get('name','?')}({_summarize_args(ev.get('input', {}))})")
+                elif t == "tool_result":
+                    o = ev.get("output", "")
+                    if ev.get("is_error"):
+                        print(f"< ERROR: {o[:200]}")
+                    else:
+                        print(f"< [{len(o.encode('utf-8', errors='replace'))} bytes]")
+                elif t == "status":
+                    print(f"~ {ev.get('message','')}")
+                elif t == "error":
+                    print(f"! {ev.get('message','')}")
+                    break
+                elif t == "approval_request":
+                    name, inp = ev.get("name", "?"), ev.get("input", {})
+                    print(f"? Allow {name}({_summarize_args(inp)})? [y/N] ", end="", flush=True)
+                    reply = sys.stdin.readline().strip().lower()
+                    self.iq.put({"type": "approval", "approved": reply.startswith("y")})
+                elif t == "turn_complete":
+                    usage = ev.get("usage", {})
+                    self.tokens_in += usage.get("input_tokens", 0)
+                    self.tokens_out += usage.get("output_tokens", 0)
+                    break
+            print("> ", end="", flush=True)
 
 # --- Config & Main ---
 
