@@ -509,7 +509,7 @@ proc sha256Bytes(s: string): array[32, byte] =
 # MCP client + OAuth 2.1
 # ------------------------------------------------------------------------------
 
-import std/[base64, uri, net, nativesockets, browsers]
+import std/[base64, uri, net, browsers]
 
 # BSD flock(2) — not part of POSIX but available on macOS/Linux. Nim's
 # std/posix doesn't wrap it, so we bind it ourselves.
