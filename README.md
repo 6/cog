@@ -1,8 +1,14 @@
 # cog
 
-Minimal terminal coding agent. Python 3.9+, stdlib only, single file.
+```
+█▀▀ █▀█ █▀▀
+█   █ █ █ █
+▀▀▀ ▀▀▀ ▀▀▀
+```
 
-Streams responses from the Anthropic Messages API (or compatible providers like Minimax), executes tools (file ops, shell, MCP), and loops until the task is complete.
+Minimal terminal coding agent. **Zero external dependencies** — pure Python 3.9+ standard library, **single file** for portability. Drop `cog.py` anywhere a Python interpreter exists and run it.
+
+Streams responses from the Anthropic Messages API (or compatible providers like OpenRouter, Minimax, Z.ai, Kimi, Ollama, and LM Studio), executes tools (file ops, shell, MCP), and loops until the task is complete.
 
 ## Usage
 
