@@ -535,10 +535,12 @@ def _out_inline(s):
 
 class TUI:
     def __init__(self, event_queue, input_queue, model="", cwd="", tool_count=0,
-                 token_threshold_warn=100000, token_threshold_danger=200000, models=None):
+                 token_threshold_warn=100000, token_threshold_danger=200000, models=None, mcp_servers=None):
         self.eq, self.iq = event_queue, input_queue
         self.model, self.cwd, self.tool_count = model, cwd, tool_count
         self.models = models or {}
+        self.mcp_servers = mcp_servers or []
+        self._mcp_tools = {}
         self._active_model_key = ""
         self.token_threshold_warn, self.token_threshold_danger = token_threshold_warn, token_threshold_danger
         self.git_branch = _git_branch(cwd)
@@ -811,7 +813,7 @@ class TUI:
             self.ibuf = self._history[self._hist_idx]
         self.cpos = len(self.ibuf)
 
-    _SLASH_CMDS = ["/help", "/clear", "/tokens", "/model", "/quit", "/exit"]
+    _SLASH_CMDS = ["/help", "/clear", "/tokens", "/model", "/mcp", "/quit", "/exit"]
 
     def _ghost_complete(self):
         buf = self.ibuf.strip()
@@ -832,6 +834,7 @@ class TUI:
   /clear        clear screen
   /tokens       show token usage
   /model [name] show or switch model
+  /mcp [name]   list MCP servers or tools
   /quit         exit
 
 {d}Shortcuts:{r}
@@ -868,6 +871,24 @@ class TUI:
                     _out(f"  {d}switched to{r} {self.model}")
                 else:
                     _out(f"  {d}unknown model: {name} (available: {', '.join(self.models.keys())}){r}")
+        elif c == "/mcp":
+            parts = cmd.split(maxsplit=1)
+            if not self.mcp_servers:
+                _out(f"  {d}no MCP servers configured{r}"); return
+            if len(parts) == 1:
+                for s in self.mcp_servers:
+                    sname = s.get("name", "?")
+                    n = sum(1 for _, e in self._mcp_tools.items() if e[1].get("name") == sname)
+                    _out(f"  {d}{sname}{r} {s.get('url', '')} {d}({n} tools){r}")
+            else:
+                name = parts[1].strip()
+                found = False
+                for tname, entry in self._mcp_tools.items():
+                    if entry[1].get("name") == name or len(self.mcp_servers) == 1:
+                        _out(f"  {d}{tname}:{r} {entry[2].get('description', '')[:80]}")
+                        found = True
+                if not found:
+                    _out(f"  {d}no tools found for '{name}'{r}")
         elif c in ("/quit", "/exit"):
             self.running = False; return
         else:
@@ -1068,9 +1089,11 @@ def main():
     eq, iq = queue.Queue(), queue.Queue()
     agent = Agent(cfg, tool_reg, eq, iq)
     threading.Thread(target=agent.worker_loop, daemon=True).start()
-    TUI(eq, iq, model=cfg.model, cwd=cwd, tool_count=len(tool_reg),
+    tui = TUI(eq, iq, model=cfg.model, cwd=cwd, tool_count=len(tool_reg),
         token_threshold_warn=cfg.token_threshold_warn, token_threshold_danger=cfg.token_threshold_danger,
-        models=cfg.models).run()
+        models=cfg.models, mcp_servers=cfg.mcp_servers)
+    tui._mcp_tools = {k: v for k, v in tool_reg.items() if v[0] == "mcp"}
+    tui.run()
     iq.put(None)
 
 if __name__ == "__main__":
