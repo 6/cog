@@ -94,17 +94,14 @@ Any provider that implements the Anthropic Messages API works — change `api_ba
 
 ## Local development
 
-cog is a single stdlib-only file — no install step, no dependencies to manage.
-
-### Running tests
+cog itself has no runtime dependencies — `python3 cog.py` is all you need to run it. Dev tasks are wired up through [mise](https://mise.jdx.dev):
 
 ```
-python3 -m unittest discover tests
+mise install       # installs the pinned ruff version
+mise run test      # runs the unittest suite under tests/
+mise run lint      # ruff check
+mise run fmt       # ruff format
 ```
-
-The suite lives in `tests/` and uses `unittest` (stdlib). It covers the path boundary guard, config loading, skill parsing, the SSE stream decoder, the file tools, and a few small string parsers. Runs in under a second.
-
-### Piped / non-interactive mode
 
 For scripts and CI, cog falls back to a line-oriented mode when stdin is not a TTY:
 

@@ -1,0 +1,14 @@
+[tools]
+ruff = "0.15.10"
+
+[tasks.test]
+description = "Run the unittest suite"
+run = "python3 -m unittest discover tests"
+
+[tasks.lint]
+description = "Lint with ruff"
+run = "ruff check cog.py tests"
+
+[tasks.fmt]
+description = "Format with ruff"
+run = "ruff format cog.py tests"
