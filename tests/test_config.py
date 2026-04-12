@@ -1,5 +1,6 @@
 """Config loading helpers: env-var expansion, walkup for local .cog/config.json,
 skill file parsing."""
+
 import os
 import shutil
 import tempfile

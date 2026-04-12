@@ -1,5 +1,6 @@
 """Path boundary checks for cog._resolve — the security-critical guard that
 prevents file tools from escaping the working directory."""
+
 import os
 import shutil
 import tempfile

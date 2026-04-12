@@ -1,6 +1,7 @@
 """Tool implementations: read_file, write_file, str_replace, list_dir. Each
 tool returns either an OK string or an `ERROR: ...` string; we never rely on
 exceptions escaping into the agent loop."""
+
 import os
 import shutil
 import tempfile

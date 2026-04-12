@@ -1,5 +1,6 @@
 """Skill loader — walks skills_dirs for SKILL.md, parses optional YAML-ish
 frontmatter, returns {name, text} entries."""
+
 import os
 import shutil
 import tempfile

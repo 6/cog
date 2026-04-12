@@ -1,6 +1,7 @@
 """parse_sse_stream — the Anthropic Messages API SSE wire-format decoder.
 Highest-leverage test target: a regression in the parser silently breaks every
 turn. We feed it synthetic byte streams and assert the yielded event shape."""
+
 import json
 import unittest
 
@@ -31,15 +32,34 @@ def _encode(events):
 
 class TestParseSseStream(unittest.TestCase):
     def test_plain_text_turn(self):
-        resp = _FakeResponse(_encode([
-            ("message_start", {"message": {"usage": {"input_tokens": 10}}}),
-            ("content_block_start", {"index": 0, "content_block": {"type": "text"}}),
-            ("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": "Hello"}}),
-            ("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": " world"}}),
-            ("content_block_stop", {"index": 0}),
-            ("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
-            ("message_stop", {}),
-        ]))
+        resp = _FakeResponse(
+            _encode(
+                [
+                    ("message_start", {"message": {"usage": {"input_tokens": 10}}}),
+                    (
+                        "content_block_start",
+                        {"index": 0, "content_block": {"type": "text"}},
+                    ),
+                    (
+                        "content_block_delta",
+                        {"index": 0, "delta": {"type": "text_delta", "text": "Hello"}},
+                    ),
+                    (
+                        "content_block_delta",
+                        {"index": 0, "delta": {"type": "text_delta", "text": " world"}},
+                    ),
+                    ("content_block_stop", {"index": 0}),
+                    (
+                        "message_delta",
+                        {
+                            "delta": {"stop_reason": "end_turn"},
+                            "usage": {"output_tokens": 5},
+                        },
+                    ),
+                    ("message_stop", {}),
+                ]
+            )
+        )
         events = list(cog.parse_sse_stream(resp))
         kinds = [k for k, _ in events]
         self.assertEqual(kinds.count("text_delta"), 2)
@@ -58,19 +78,53 @@ class TestParseSseStream(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 5)
 
     def test_tool_use_accumulates_partial_json(self):
-        resp = _FakeResponse(_encode([
-            ("message_start", {"message": {"usage": {"input_tokens": 5}}}),
-            ("content_block_start", {"index": 0,
-                "content_block": {"type": "tool_use", "id": "t1", "name": "read_file"}}),
-            ("content_block_delta", {"index": 0,
-                "delta": {"type": "input_json_delta", "partial_json": '{"path": "'}}),
-            ("content_block_delta", {"index": 0,
-                "delta": {"type": "input_json_delta", "partial_json": 'x.txt"}'}}),
-            ("content_block_stop", {"index": 0}),
-            ("message_delta", {"delta": {"stop_reason": "tool_use"},
-                "usage": {"output_tokens": 10}}),
-            ("message_stop", {}),
-        ]))
+        resp = _FakeResponse(
+            _encode(
+                [
+                    ("message_start", {"message": {"usage": {"input_tokens": 5}}}),
+                    (
+                        "content_block_start",
+                        {
+                            "index": 0,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "read_file",
+                            },
+                        },
+                    ),
+                    (
+                        "content_block_delta",
+                        {
+                            "index": 0,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": '{"path": "',
+                            },
+                        },
+                    ),
+                    (
+                        "content_block_delta",
+                        {
+                            "index": 0,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": 'x.txt"}',
+                            },
+                        },
+                    ),
+                    ("content_block_stop", {"index": 0}),
+                    (
+                        "message_delta",
+                        {
+                            "delta": {"stop_reason": "tool_use"},
+                            "usage": {"output_tokens": 10},
+                        },
+                    ),
+                    ("message_stop", {}),
+                ]
+            )
+        )
         events = list(cog.parse_sse_stream(resp))
         tool_uses = [p for k, p in events if k == "tool_use"]
         self.assertEqual(len(tool_uses), 1)
@@ -86,17 +140,43 @@ class TestParseSseStream(unittest.TestCase):
         self.assertLess(bd_idx, tu_idx)
 
     def test_malformed_tool_json_returns_raw(self):
-        resp = _FakeResponse(_encode([
-            ("message_start", {"message": {"usage": {"input_tokens": 1}}}),
-            ("content_block_start", {"index": 0,
-                "content_block": {"type": "tool_use", "id": "t2", "name": "x"}}),
-            ("content_block_delta", {"index": 0,
-                "delta": {"type": "input_json_delta", "partial_json": "{bad"}}),
-            ("content_block_stop", {"index": 0}),
-            ("message_delta", {"delta": {"stop_reason": "tool_use"},
-                "usage": {"output_tokens": 1}}),
-            ("message_stop", {}),
-        ]))
+        resp = _FakeResponse(
+            _encode(
+                [
+                    ("message_start", {"message": {"usage": {"input_tokens": 1}}}),
+                    (
+                        "content_block_start",
+                        {
+                            "index": 0,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": "t2",
+                                "name": "x",
+                            },
+                        },
+                    ),
+                    (
+                        "content_block_delta",
+                        {
+                            "index": 0,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": "{bad",
+                            },
+                        },
+                    ),
+                    ("content_block_stop", {"index": 0}),
+                    (
+                        "message_delta",
+                        {
+                            "delta": {"stop_reason": "tool_use"},
+                            "usage": {"output_tokens": 1},
+                        },
+                    ),
+                    ("message_stop", {}),
+                ]
+            )
+        )
         events = list(cog.parse_sse_stream(resp))
         tool_uses = [p for k, p in events if k == "tool_use"]
         self.assertEqual(tool_uses[0]["input"], {"_raw": "{bad"})

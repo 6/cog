@@ -1,4 +1,5 @@
 """Small pure-function tests: _summarize_args, _mcp_parse_www_auth."""
+
 import unittest
 
 import cog
@@ -18,7 +19,9 @@ class TestSummarizeArgs(unittest.TestCase):
         self.assertLess(len(r), 200)
 
     def test_total_length_capped(self):
-        r = cog._summarize_args({"a": "1" * 30, "b": "2" * 30, "c": "3" * 30}, max_len=50)
+        r = cog._summarize_args(
+            {"a": "1" * 30, "b": "2" * 30, "c": "3" * 30}, max_len=50
+        )
         self.assertLessEqual(len(r), 50)
 
     def test_non_string_value(self):
