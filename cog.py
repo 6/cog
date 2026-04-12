@@ -161,7 +161,7 @@ def build_request(model, system, messages, tools, max_tokens=4096):
     req = {"model": model, "max_tokens": max_tokens, "system": system,
            "messages": messages, "stream": True}
     if tools:
-        req["tools"] = [t for _, _, t in tools.values()]
+        req["tools"] = [entry[2] for entry in tools.values()]
     return req
 
 def stream_request(api_key, request_body, api_base_url="https://api.anthropic.com"):
