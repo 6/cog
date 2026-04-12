@@ -105,8 +105,7 @@ cog itself has no runtime dependencies — `python3 cog.py` is all you need to r
 ```
 mise install       # installs the pinned dev tools (ruff, basedpyright)
 mise run test      # runs the unittest suite under tests/
-mise run lint      # ruff check
-mise run fmt       # ruff format
+mise run lint      # ruff check (with E701/E702 ignored — terse one-liners are intentional)
 mise run typecheck # basedpyright
 ```
 

@@ -10,12 +10,8 @@ description = "Run the unittest suite"
 run = "python3 -m unittest discover tests"
 
 [tasks.lint]
-description = "Lint with ruff"
-run = "ruff check cog.py tests"
-
-[tasks.fmt]
-description = "Format with ruff"
-run = "ruff format cog.py tests"
+description = "Lint with ruff (ignore E701/E702 — terse one-liners are intentional)"
+run = "ruff check --ignore E701,E702 cog.py tests"
 
 [tasks.typecheck]
 description = "Type-check with basedpyright"
