@@ -27,6 +27,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Iterator
 
 # --- Tools ---
 
@@ -282,7 +283,7 @@ def stream_request(api_key, request_body, api_base_url="https://api.anthropic.co
     return resp, conn
 
 
-def parse_sse_stream(response):
+def parse_sse_stream(response) -> Iterator[tuple[str, Any]]:
     event_type = None
     block_type = block_id = block_name = None
     block_index = -1
@@ -1782,9 +1783,9 @@ class Config:
     model: str = "claude-sonnet-4-20250514"
     api_key_env: str = "ANTHROPIC_API_KEY"
     api_base_url: str = "https://api.anthropic.com"
-    models: dict[str, dict] = field(default_factory=dict)
+    models: dict[str, dict[str, Any]] = field(default_factory=dict)
     skills_dirs: list[str] = field(default_factory=list)
-    mcp_servers: list[dict] = field(default_factory=list)
+    mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     max_tool_calls_per_turn: int = 10
     shell_timeout_seconds: int = 30
     tool_output_max_bytes: int = 32768
@@ -1813,7 +1814,7 @@ _SYSTEM = (
 )
 
 
-def _expand_env(v):
+def _expand_env(v) -> Any:
     if isinstance(v, str):
         return re.sub(r"\$\{([^}]+)\}", lambda m: os.environ.get(m.group(1), ""), v)
     if isinstance(v, dict):
@@ -1838,7 +1839,7 @@ def _find_local_config(cwd):
 
 def _load_config(path, cwd="."):
     path = os.path.expanduser(path)
-    raw = {}
+    raw: dict[str, Any] = {}
     if os.path.exists(path):
         mode = os.stat(path).st_mode & 0o777
         if mode & 0o077:

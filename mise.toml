@@ -19,4 +19,4 @@ run = "ruff format cog.py tests"
 
 [tasks.typecheck]
 description = "Type-check with basedpyright"
-run = "basedpyright cog.py"
+run = "basedpyright --level error cog.py"
