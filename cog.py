@@ -40,7 +40,10 @@ def _resolve(path):
     p = Path(path)
     if not p.is_absolute():
         p = Path(_cwd) / p
-    return str(p.resolve())
+    resolved = str(p.resolve())
+    if not resolved.startswith(_cwd):
+        raise ValueError(f"path escapes working directory: {path}")
+    return resolved
 
 def tool_read_file(args):
     path = _resolve(args["path"])
@@ -1277,7 +1280,7 @@ class TUI:
                     try:
                         ev = self.eq.get_nowait()
                         self._handle_event(ev)
-                    except Exception: break
+                    except queue.Empty: break
                 r, _, _ = select.select([sys.stdin], [], [], 0.02)
                 if r: self._handle_key(os.read(_fd, 1))
                 self._tick_spinner()
