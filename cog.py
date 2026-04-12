@@ -146,8 +146,9 @@ def get_tools():
 # --- Anthropic API ---
 
 class APIError(Exception):
-    def __init__(self, status, body):
-        self.status, self.body = status, body
+    def __init__(self, status, body, retry_after=None):
+        self.status, self.body, self.retry_after = status, body, retry_after
+        self.retryable = status in (429, 500, 502, 503, 529)
         super().__init__(f"API error {status}: {body}")
 
 def build_request(model, system, messages, tools, max_tokens=4096):
@@ -172,9 +173,12 @@ def stream_request(api_key, request_body, api_base_url="https://api.anthropic.co
     conn.request("POST", f"{base_path}/v1/messages", json.dumps(request_body), headers)
     resp = conn.getresponse()
     if resp.status != 200:
+        retry_after = resp.getheader("retry-after")
         body = resp.read().decode("utf-8", errors="replace")
         conn.close()
-        raise APIError(resp.status, body)
+        try: ra = float(retry_after) if retry_after else None
+        except (ValueError, TypeError): ra = None
+        raise APIError(resp.status, body, ra)
     return resp, conn
 
 def parse_sse_stream(response):
@@ -358,12 +362,27 @@ class Agent:
             req = build_request(self.model, self.system, self.messages, self.tools)
             if self.verbose:
                 self.emit({"type": "verbose", "data": json.dumps(req, indent=2)})
-            try:
-                resp, conn = stream_request(self.api_key, req, self.api_base_url)
-            except APIError as e:
-                self.emit({"type": "error", "message": str(e)}); return
-            except Exception as e:
-                self.emit({"type": "error", "message": f"Network error: {e}"}); return
+            resp = conn = None
+            for attempt in range(5):
+                try:
+                    resp, conn = stream_request(self.api_key, req, self.api_base_url)
+                    break
+                except APIError as e:
+                    if e.retryable and attempt < 4:
+                        delay = e.retry_after or min(2 ** attempt, 30)
+                        self.emit({"type": "status", "message": f"API error {e.status}, retrying in {delay:.0f}s..."})
+                        time.sleep(delay)
+                        continue
+                    self.emit({"type": "error", "message": str(e)}); return
+                except Exception as e:
+                    if attempt < 4:
+                        delay = min(2 ** attempt, 30)
+                        self.emit({"type": "status", "message": f"Network error, retrying in {delay:.0f}s..."})
+                        time.sleep(delay)
+                        continue
+                    self.emit({"type": "error", "message": f"Network error: {e}"}); return
+            if resp is None:
+                return
             content_blocks, tool_uses, usage, full_text = [], [], {}, ""
             try:
                 for kind, payload in parse_sse_stream(resp):
@@ -667,6 +686,9 @@ class TUI:
         elif t == "verbose":
             for line in ev.get("data", "").split("\n"):
                 _out(f"\033[2m  {line}\033[0m")
+        elif t == "status":
+            self._stop_spinner()
+            _out(f"\033[33m~ {ev.get('message','')}\033[0m")
         elif t == "error":
             self._stop_spinner()
             _out(f"\033[31m! {ev.get('message','')}\033[0m")
