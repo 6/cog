@@ -540,11 +540,15 @@ class TUI:
         self.ibuf, self.cpos = "", 0
         self.running = True
         self.approval = None
+        self._history = []
+        self._hist_idx = 0
+        self._hist_stash = ""
         self._spinner = False
         self._spinner_frame = 0
         self._spinner_time = 0.0
         self._SPIN = "⠷⠯⠻⠽⠾"
         self._spin_line_active = False
+        self._streaming_started = False
 
     def _prompt_prefix(self):
         cwd_short = os.path.basename(self.cwd) or self.cwd
@@ -668,7 +672,12 @@ class TUI:
             pass  # already printed by submit handler
         elif t == "assistant_text_delta":
             self._stop_spinner()
-            _out_inline(ev.get("text", ""))
+            text = ev.get("text", "")
+            if not self._streaming_started:
+                text = text.lstrip("\n")
+                if not text: return
+                self._streaming_started = True
+            _out_inline(text)
         elif t == "assistant_text_final":
             _out("")  # newline after streaming
         elif t == "tool_call":
@@ -682,6 +691,7 @@ class TUI:
                 _out(f"\033[31m< ERROR: {o[:200]}\033[0m")
             else:
                 _out(f"\033[2m< [{len(o.encode('utf-8',errors='replace'))} bytes]\033[0m")
+            self._streaming_started = False
             self._start_spinner()
         elif t == "verbose":
             for line in ev.get("data", "").split("\n"):
@@ -697,6 +707,7 @@ class TUI:
             usage = ev.get("usage", {})
             self.tokens_in += usage.get("input_tokens", 0)
             self.tokens_out += usage.get("output_tokens", 0)
+            _out("")
             self._draw_input()
         elif t == "approval_request":
             self._stop_spinner()
@@ -719,6 +730,9 @@ class TUI:
             text = self.ibuf.strip()
             if text:
                 self._clear_input()
+                self._history.append(text)
+                self._hist_idx = len(self._history)
+                self._hist_stash = ""
                 self.ibuf, self.cpos = "", 0
                 if text.startswith("/"):
                     ghost = self._ghost_complete()
@@ -728,6 +742,7 @@ class TUI:
                     self._draw_input()
                     return
                 _out(f"{self._prompt_prefix()} {self._caret()} {text}")
+                self._streaming_started = False
                 self.iq.put(text)
                 self._start_spinner()
                 return
@@ -772,6 +787,23 @@ class TUI:
         while i < n and not self.ibuf[i].isalnum(): i += 1
         while i < n and self.ibuf[i].isalnum(): i += 1
         return i
+
+    def _hist_prev(self):
+        if not self._history or self._hist_idx <= 0: return
+        if self._hist_idx == len(self._history):
+            self._hist_stash = self.ibuf
+        self._hist_idx -= 1
+        self.ibuf = self._history[self._hist_idx]
+        self.cpos = len(self.ibuf)
+
+    def _hist_next(self):
+        if self._hist_idx >= len(self._history): return
+        self._hist_idx += 1
+        if self._hist_idx == len(self._history):
+            self.ibuf = self._hist_stash
+        else:
+            self.ibuf = self._history[self._hist_idx]
+        self.cpos = len(self.ibuf)
 
     _SLASH_CMDS = ["/help", "/clear", "/tokens", "/model", "/quit", "/exit"]
 
@@ -836,7 +868,9 @@ class TUI:
                 if not r: break
                 b = os.read(_fd, 1); seq += b
                 if b and b[0] >= 0x40: break
-            if seq == b"D" and self.cpos > 0: self.cpos -= 1
+            if seq == b"A": self._hist_prev()
+            elif seq == b"B": self._hist_next()
+            elif seq == b"D" and self.cpos > 0: self.cpos -= 1
             elif seq == b"C" and self.cpos < len(self.ibuf): self.cpos += 1
             elif seq in (b"H", b"1~"): self.cpos = 0
             elif seq in (b"F", b"4~"): self.cpos = len(self.ibuf)
@@ -857,9 +891,11 @@ class TUI:
                 r, _, _ = select.select([sys.stdin], [], [], 0.02)
                 if r: self._handle_key(os.read(_fd, 1))
                 self._tick_spinner()
+        except KeyboardInterrupt:
+            pass
         finally:
             _restore_term()
-            print()
+            _out("\n\033[2mbye\033[0m")
 
 # --- Config & Main ---
 
