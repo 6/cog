@@ -244,6 +244,11 @@ def parse_sse_stream(response):
 class MCPError(Exception):
     pass
 
+class MCPAuthRequired(MCPError):
+    def __init__(self, name):
+        self.name = name
+        super().__init__(f"MCP server '{name}' requires auth (run /mcp auth {name})")
+
 def _mcp_connect(parsed_url):
     if parsed_url.scheme == "https":
         return http.client.HTTPSConnection(parsed_url.hostname, parsed_url.port or 443, timeout=30)
@@ -267,12 +272,14 @@ def _mcp_post(server, method, params=None, is_notification=False):
     conn = _mcp_connect(parsed)
     conn.request("POST", parsed.path or "/", json.dumps(body), headers)
     resp = conn.getresponse()
-    if resp.status == 401 and not server.get("_oauth_attempted"):
+    if resp.status == 401:
         resp.read(); conn.close()
-        server["_oauth_attempted"] = True
-        token = _mcp_oauth_flow(server)
-        server["_oauth_token"] = token
-        return _mcp_post(server, method, params, is_notification)
+        if server.get("_oauth_interactive"):
+            server["_oauth_interactive"] = False
+            token = _mcp_oauth_flow(server)
+            server["_oauth_token"] = token
+            return _mcp_post(server, method, params, is_notification)
+        raise MCPAuthRequired(server.get("name", "mcp"))
     if is_notification:
         resp.read(); conn.close(); return None
     ct = resp.getheader("Content-Type", "")
@@ -481,8 +488,8 @@ def mcp_call_tool(server, tool_name, arguments):
 
 def mcp_discover_all(mcp_configs):
     if not mcp_configs:
-        return {}, []
-    servers, tools, multi = [], {}, len(mcp_configs) > 1
+        return {}, [], []
+    servers, tools, pending_auth, multi = [], {}, [], len(mcp_configs) > 1
     for cfg in mcp_configs:
         name = cfg.get("name", "mcp")
         try:
@@ -497,9 +504,11 @@ def mcp_discover_all(mcp_configs):
                     {"name": tname, "description": t.get("description", ""),
                      "input_schema": t.get("inputSchema", {"type": "object", "properties": {}})},
                     t["name"])
+        except MCPAuthRequired:
+            pending_auth.append(cfg)
         except Exception as e:
             print(f"Warning: MCP server '{name}' failed: {e}", file=sys.stderr)
-    return tools, servers
+    return tools, servers, pending_auth
 
 # --- Agent ---
 
@@ -1043,14 +1052,53 @@ class TUI:
                 else:
                     _out(f"  {d}unknown model: {name} (available: {', '.join(self.models.keys())}){r}")
         elif c == "/mcp":
-            parts = cmd.split(maxsplit=1)
+            parts = cmd.split(maxsplit=2)
             if not self.mcp_servers:
                 _out(f"  {d}no MCP servers configured{r}"); return
             if len(parts) == 1:
                 for s in self.mcp_servers:
                     sname = s.get("name", "?")
-                    n = sum(1 for _, e in self._mcp_tools.items() if e[1].get("name") == sname)
-                    _out(f"  {d}{sname}{r} {s.get('url', '')} {d}({n} tools){r}")
+                    pending = any(p.get("name") == sname for p in getattr(self, "_pending_auth", []))
+                    if pending:
+                        _out(f"  {d}{sname}{r} {s.get('url', '')} \033[33m(auth required: /mcp auth {sname})\033[0m")
+                    else:
+                        n = sum(1 for _, e in self._mcp_tools.items() if e[1].get("name") == sname)
+                        _out(f"  {d}{sname}{r} {s.get('url', '')} {d}({n} tools){r}")
+            elif parts[1] == "revoke" and len(parts) == 3:
+                name = parts[2].strip()
+                path = _mcp_token_path(name)
+                if os.path.exists(path):
+                    os.remove(path)
+                    _out(f"  {d}token revoked for {name}{r}")
+                else:
+                    _out(f"  {d}no token found for {name}{r}")
+            elif parts[1] == "auth" and len(parts) == 3:
+                name = parts[2].strip()
+                pending = [p for p in getattr(self, "_pending_auth", []) if p.get("name") == name]
+                if not pending:
+                    _out(f"  {d}{name} does not need auth{r}"); return
+                try:
+                    pcfg = pending[0]
+                    pcfg["_oauth_interactive"] = True
+                    server = mcp_initialize(pcfg)
+                    server["name"] = name
+                    result = _mcp_post(server, "tools/list", {})
+                    mcp_tools = (result or {}).get("result", {}).get("tools", []) if result and "error" not in result else []
+                    multi = len(self.mcp_servers) > 1
+                    for t in mcp_tools:
+                        tname = f"{name}__{t['name']}" if multi else t["name"]
+                        entry = ("mcp", server,
+                            {"name": tname, "description": t.get("description", ""),
+                             "input_schema": t.get("inputSchema", {"type": "object", "properties": {}})},
+                            t["name"])
+                        self._mcp_tools[tname] = entry
+                        self._tool_reg[tname] = entry
+                        self._agent.tools[tname] = entry
+                    self._pending_auth = [p for p in self._pending_auth if p.get("name") != name]
+                    self.tool_count = len(self._tool_reg)
+                    _out(f"  {d}authenticated. {len(mcp_tools)} tools loaded from {name}{r}")
+                except Exception as e:
+                    _out(f"  \033[31mauth failed: {e}\033[0m")
             else:
                 name = parts[1].strip()
                 found = False
@@ -1097,6 +1145,12 @@ class TUI:
     def run(self):
         _set_cbreak(); atexit.register(_restore_term)
         self._banner()
+        pending = getattr(self, "_pending_auth", [])
+        if pending:
+            n = len(pending)
+            names = ", ".join(p.get("name", "?") for p in pending)
+            _out(f"\033[33m{n} MCP server{'s' if n > 1 else ''} need auth: {names}\033[0m")
+            _out(f"\033[2mrun /mcp to see details\033[0m\n")
         try:
             self._draw_input()
             while self.running:
@@ -1248,7 +1302,7 @@ def main():
         prompt += f'\n<skill name="{s["name"]}">\n{s["text"]}\n</skill>\n'
 
     tool_reg = get_tools()
-    mcp_tools, _ = mcp_discover_all(cfg.mcp_servers)
+    mcp_tools, _, pending_auth = mcp_discover_all(cfg.mcp_servers)
     tool_reg.update(mcp_tools)
 
     os.makedirs(cfg.log_dir, exist_ok=True)
@@ -1264,6 +1318,9 @@ def main():
         token_threshold_warn=cfg.token_threshold_warn, token_threshold_danger=cfg.token_threshold_danger,
         models=cfg.models, mcp_servers=cfg.mcp_servers)
     tui._mcp_tools = {k: v for k, v in tool_reg.items() if v[0] == "mcp"}
+    tui._pending_auth = pending_auth
+    tui._tool_reg = tool_reg
+    tui._agent = agent
     tui.run()
     iq.put(None)
 
