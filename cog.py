@@ -1113,7 +1113,18 @@ class TUI:
                 path = _mcp_token_path(name)
                 if os.path.exists(path):
                     os.remove(path)
-                    _out(f"  {d}token revoked for {name}{r}")
+                    # Remove tools from active session
+                    to_remove = [t for t, e in self._mcp_tools.items() if e[1].get("name") == name]
+                    for t in to_remove:
+                        self._mcp_tools.pop(t, None)
+                        self._tool_reg.pop(t, None)
+                        self._agent.tools.pop(t, None)
+                    self.tool_count = len(self._tool_reg)
+                    # Add back to pending auth
+                    srv = next((s for s in self.mcp_servers if s.get("name") == name), None)
+                    if srv and srv not in self._pending_auth:
+                        self._pending_auth.append(srv)
+                    _out(f"  {d}token revoked for {name}, {len(to_remove)} tools removed{r}")
                 else:
                     _out(f"  {d}no token found for {name}{r}")
             elif parts[1] == "auth" and len(parts) == 3:
