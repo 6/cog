@@ -17,7 +17,7 @@ cog is a single Python file with a shebang — you can run it from anywhere by d
 **Symlink (tracks upstream changes):**
 
 ```sh
-git clone https://github.com/<you>/cog ~/src/cog
+git clone https://github.com/6/cog ~/src/cog
 chmod +x ~/src/cog/cog.py
 ln -s ~/src/cog/cog.py ~/.local/bin/cog
 ```
@@ -25,7 +25,7 @@ ln -s ~/src/cog/cog.py ~/.local/bin/cog
 **Copy (one-shot, no git):**
 
 ```sh
-curl -o ~/.local/bin/cog https://raw.githubusercontent.com/<you>/cog/main/cog.py
+curl -o ~/.local/bin/cog https://raw.githubusercontent.com/6/cog/main/cog.py
 chmod +x ~/.local/bin/cog
 ```
 
