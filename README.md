@@ -12,24 +12,14 @@ Streams responses from the Anthropic Messages API (or compatible providers like 
 
 ## Install
 
-cog is a single Python file with a shebang — you can run it from anywhere by dropping it on your `$PATH`.
-
-**Symlink (tracks upstream changes):**
-
-```sh
-git clone https://github.com/6/cog ~/src/cog
-chmod +x ~/src/cog/cog.py
-ln -s ~/src/cog/cog.py ~/.local/bin/cog
-```
-
-**Copy (one-shot, no git):**
+cog is a single Python file with a shebang. Drop it on your `$PATH`:
 
 ```sh
 curl -o ~/.local/bin/cog https://raw.githubusercontent.com/6/cog/main/cog.py
 chmod +x ~/.local/bin/cog
 ```
 
-Either way, make sure `~/.local/bin` is on your `$PATH`. Then `cog` is available globally.
+Make sure `~/.local/bin` is on your `$PATH`. Then `cog` is available globally.
 
 ## Usage
 
