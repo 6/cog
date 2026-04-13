@@ -15,8 +15,7 @@ Streams responses from the Anthropic Messages API (or compatible providers like 
 cog is a single Python file with a shebang. Drop it on your `$PATH`:
 
 ```sh
-curl -o ~/.local/bin/cog https://raw.githubusercontent.com/6/cog/main/cog.py
-chmod +x ~/.local/bin/cog
+curl -fsSL https://raw.githubusercontent.com/6/cog/main/cog.py -o ~/.local/bin/cog && chmod +x ~/.local/bin/cog
 ```
 
 Make sure `~/.local/bin` is on your `$PATH`. Then `cog` is available globally.
