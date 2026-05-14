@@ -6,9 +6,9 @@
 ▀▀▀ ▀▀▀ ▀▀▀
 ```
 
-Minimal terminal coding agent. **Zero external dependencies** — pure Python 3.9+ standard library, **single file** for portability. Drop `cog.py` anywhere a Python interpreter exists and run it.
+A small terminal coding agent. **Zero external dependencies** (just the Python 3.9+ standard library) and ships as a **single file** you can drop anywhere there's a Python interpreter.
 
-Streams responses from the Anthropic Messages API (or compatible providers like OpenRouter, Minimax, Z.ai, Kimi, Ollama, and LM Studio), executes tools (file ops, shell, MCP), and loops until the task is complete.
+Talks to the Anthropic Messages API, or anything else that speaks it: Minimax, Kimi, GLM (Z.ai), OpenRouter, Ollama, LM Studio, and so on.
 
 ## Install
 
@@ -56,37 +56,29 @@ Optional. Create `~/.config/cog/config.json` (respects `XDG_CONFIG_HOME`):
 
 All fields are optional and fall back to defaults. `${ENV_VAR}` syntax is expanded in string values. Logs go to `~/.config/cog/logs/` and OAuth tokens to `~/.config/cog/tokens/`.
 
-### Using with Minimax
-
-Minimax provides an [Anthropic-compatible API](https://platform.minimax.io/docs/api-reference/text-anthropic-api). Set `api_base_url`, `model`, and `api_key_env` in your config:
-
-```json
-{
-  "api_base_url": "https://api.minimax.io/anthropic",
-  "model": "MiniMax-M2.7",
-  "api_key_env": "MINIMAX_API_KEY"
-}
-```
-
-Then set `MINIMAX_API_KEY` in your environment and run `cog`.
-
-### Using with LM Studio
-
-[LM Studio](https://lmstudio.ai) provides a local Anthropic-compatible endpoint. Load a model in LM Studio, then configure cog:
-
-```json
-{
-  "api_base_url": "http://localhost:1234",
-  "model": "ibm/granite-4-micro",
-  "api_key_env": "LM_API_TOKEN"
-}
-```
-
-Set `LM_API_TOKEN` in your environment (or omit `api_key_env` if LM Studio auth is disabled). The model name should match what you've loaded in LM Studio.
-
 ### Other providers
 
-Any provider that implements the Anthropic Messages API works — change `api_base_url`, `model`, and `api_key_env`.
+cog speaks the Anthropic Messages API, so anything else that speaks it works too. Point `api_base_url` at the provider's endpoint, set `model` to whatever they call the model, and `api_key_env` to the env var holding your key. For example, to use Kimi:
+
+```json
+{
+  "api_base_url": "https://api.moonshot.ai/anthropic",
+  "model": "kimi-k2.6",
+  "api_key_env": "MOONSHOT_API_KEY"
+}
+```
+
+A few that work today (model names move fast, check the provider's docs for the current flagship):
+
+| Provider | `api_base_url` | Example `model` |
+|---|---|---|
+| [Minimax](https://platform.minimax.io/docs/api-reference/text-anthropic-api) | `https://api.minimax.io/anthropic` | `MiniMax-M2.7` |
+| [Kimi (Moonshot)](https://platform.moonshot.ai) | `https://api.moonshot.ai/anthropic` | `kimi-k2.6` |
+| [GLM (Z.ai)](https://docs.z.ai/scenario-example/develop-tools/claude) | `https://api.z.ai/api/anthropic` | `glm-5.1` |
+| [LM Studio](https://lmstudio.ai) (local) | `http://localhost:1234` | whatever you loaded |
+| [Ollama](https://ollama.com) (local) | `http://localhost:11434` | whatever you pulled |
+
+For local endpoints with auth disabled you can omit `api_key_env`.
 
 ## Tools
 
@@ -109,12 +101,12 @@ Any provider that implements the Anthropic Messages API works — change `api_ba
 
 ## Local development
 
-cog itself has no runtime dependencies — `python3 cog.py` is all you need to run it. Dev tasks are wired up through [mise](https://mise.jdx.dev):
+cog itself has no runtime dependencies, so `python3 cog.py` is all you need to run it. Dev tasks are wired up through [mise](https://mise.jdx.dev):
 
 ```
 mise install       # installs the pinned dev tools (ruff, basedpyright)
 mise run test      # runs the unittest suite under tests/
-mise run lint      # ruff check (with E701/E702 ignored — terse one-liners are intentional)
+mise run lint      # ruff check (with E701/E702 ignored, terse one-liners are intentional)
 mise run typecheck # basedpyright
 ```
 
