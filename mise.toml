@@ -14,5 +14,5 @@ description = "Lint with ruff (ignore E701/E702 — terse one-liners are intenti
 run = "ruff check --ignore E701,E702 cog.py tests"
 
 [tasks.typecheck]
-description = "Type-check with basedpyright"
-run = "basedpyright --level error cog.py"
+description = "Type-check with basedpyright (fails only on errors, warnings ignored)"
+run = '''basedpyright --outputjson cog.py | python3 -c "import json,sys; s=json.load(sys.stdin)['summary']; print(s['errorCount'],'errors,',s['warningCount'],'warnings'); sys.exit(1 if s['errorCount'] else 0)"'''
