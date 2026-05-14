@@ -36,7 +36,7 @@ Optional. Create `~/.config/cog/config.json` (respects `XDG_CONFIG_HOME`):
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-sonnet-4-6",
   "api_base_url": "https://api.anthropic.com",
   "api_key_env": "ANTHROPIC_API_KEY",
   "auto_approve": false,

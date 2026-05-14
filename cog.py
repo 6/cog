@@ -1380,7 +1380,7 @@ class TUI:
 
 @dataclass
 class Config:
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "claude-sonnet-4-6"
     api_key_env: str = "ANTHROPIC_API_KEY"
     api_base_url: str = "https://api.anthropic.com"
     models: dict[str, dict[str, Any]] = field(default_factory=dict)
